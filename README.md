@@ -179,17 +179,6 @@ make clean        # Wipe all state
 
 ---
 
-## Project Roadmap
-
-| Phase | Status | Description |
-|---|---|---|
-| **1 — Core Engine** | ✅ **Done** | `@step` decorator, SQLite store, CAS artifacts, Typer CLI |
-| **2 — AI Integration** | 🔄 Planned | LangGraph + Explorer (AST) + Planner (ToT) |
-| **3 — Sandbox** | 🔄 Planned | Docker tester + Coder↔Tester retry loop |
-| **4 — Production** | 🔄 Planned | S3/MinIO, Reviewer, PR Creator, FastAPI + React Dashboard |
-
----
-
 ## KPIs
 
 | Metric | Target | Notes |
