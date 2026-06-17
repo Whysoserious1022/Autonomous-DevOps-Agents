@@ -39,6 +39,8 @@ os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 from cascade.agents.coder import CoderAgent
 from cascade.agents.explorer import ExplorerAgent
 from cascade.agents.planner import PlannerAgent
+from cascade.agents.reviewer import ReviewerAgent
+from cascade.agents.pr_creator import PRCreatorAgent
 from cascade.core.decorator import CascadeFlow, step
 from cascade.core.runner import FlowRunner
 
@@ -50,7 +52,7 @@ class DevOpsFlow(CascadeFlow):
     Full autonomous DevOps agent pipeline.
 
     Steps:
-      explorer → planner → coder
+      explorer → planner → coder → tester → reviewer → pr_creator
 
     Cache behaviour:
       explorer:  cross_run_cache=True  (keyed on commit_sha)
@@ -117,6 +119,34 @@ class DevOpsFlow(CascadeFlow):
         """
         from cascade.agents.tester import TesterAgent
         agent = TesterAgent(artifact_store=self._artifact_store)
+        return await agent.execute(inputs)
+
+    @step(
+        name="reviewer",
+        depends_on=["tester"],
+        cross_run_cache=False,
+        description="Run static scanners and security guardrails on patch",
+    )
+    async def review(self, inputs: dict) -> dict:
+        """
+        Node 5: Guardrail Agent.
+        Analyzes patch for secrets, complexity, and requests LLM review.
+        """
+        agent = ReviewerAgent(artifact_store=self._artifact_store)
+        return await agent.execute(inputs)
+
+    @step(
+        name="pr_creator",
+        depends_on=["reviewer"],
+        cross_run_cache=False,
+        description="Pushes branch and creates pull request on GitHub",
+    )
+    async def create_pr(self, inputs: dict) -> dict:
+        """
+        Node 6: GitHub PR Creator.
+        Creates git branch, applies patch, commits, pushes, and opens PR.
+        """
+        agent = PRCreatorAgent(artifact_store=self._artifact_store)
         return await agent.execute(inputs)
 
 

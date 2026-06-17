@@ -88,18 +88,50 @@ class TesterAgent(BaseAgent):
             exit_code:           Process exit code
             retry_count:         Forwarded retry count
         """
-        if not DOCKER_AVAILABLE:
-            raise RuntimeError(
-                "Docker Python SDK is not installed. "
-                "Install with: pip install cascade[sandbox]"
-            )
-
         patch_uri = inputs.get("patch_uri", inputs.get("coder.patch_uri", ""))
         commit_sha = inputs.get("commit_sha", inputs.get("explorer.commit_sha", "HEAD"))
         repo_url = inputs.get("repo_url", inputs.get("explorer.repo_url", ""))
         test_command = inputs.get("test_command", "")
         custom_image = inputs.get("image", "")
         retry_count = inputs.get("retry_count", 0)
+
+        if self._is_mock_mode():
+            # Simulated test execution
+            await asyncio.sleep(1.0)
+            
+            test_results_uri = ""
+            docker_logs_uri = ""
+            results_xml = "<testsuite name='pytest' tests='1' errors='0' failures='0' skipped='0' time='0.05'><testcase classname='tests.test_docs' name='test_disable_docs_in_production' time='0.05'/></testsuite>"
+            logs = (
+                "============================= test session starts =============================\n"
+                "platform linux -- Python 3.12.3, pytest-8.1.1, pluggy-1.4.0\n"
+                "rootdir: /app\n"
+                "collected 1 item\n\n"
+                "tests/test_docs.py .                                                     [100%]\n\n"
+                "============================== 1 passed in 0.05s =============================="
+            )
+            
+            if self._artifact_store:
+                test_results_uri = self._artifact_store.put_text(results_xml)
+                docker_logs_uri = self._artifact_store.put_text(logs)
+
+            return {
+                "test_passed": True,
+                "test_results_uri": test_results_uri,
+                "test_results_xml": results_xml,
+                "docker_logs_uri": docker_logs_uri,
+                "test_error_summary": "",
+                "exit_code": 0,
+                "retry_count": retry_count,
+                "cost_manifest_uri": self.store_cost_manifest(),
+                **self.get_cost_outputs(),
+            }
+
+        if not DOCKER_AVAILABLE:
+            raise RuntimeError(
+                "Docker Python SDK is not installed. "
+                "Install with: pip install cascade[sandbox]"
+            )
 
         if not patch_uri:
             raise ValueError("Missing patch_uri or coder.patch_uri in inputs.")

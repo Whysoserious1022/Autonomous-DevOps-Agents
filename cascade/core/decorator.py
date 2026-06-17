@@ -61,6 +61,7 @@ class StepMeta:
         timeout_seconds: int,
         cross_run_cache: bool,
         tags: dict[str, str],
+        description: str = "",
     ) -> None:
         self.name = name
         self.func = func
@@ -69,6 +70,7 @@ class StepMeta:
         self.timeout_seconds = timeout_seconds
         self.cross_run_cache = cross_run_cache
         self.tags = tags
+        self.description = description
         self.code_hash = compute_code_hash(func)
         self.is_async = inspect.iscoroutinefunction(func)
 
@@ -83,6 +85,7 @@ def step(
     timeout_seconds: int = 600,
     cross_run_cache: bool = True,
     tags: dict[str, str] | None = None,
+    description: str = "",
 ) -> Callable:
     """
     Decorator that transforms a flow method into a resumable, cached Cascade step.
@@ -95,6 +98,7 @@ def step(
         cross_run_cache:  If True, look for cache hits across ALL runs (not just current run).
                           Disable for steps that must be unique per run (e.g., PR creation).
         tags:             Arbitrary metadata tags ({"env": "prod"}).
+        description:      Human-readable description of what the step does.
 
     Example:
         @step(name="explorer", max_retries=2, cross_run_cache=True)
@@ -113,6 +117,7 @@ def step(
             timeout_seconds=timeout_seconds,
             cross_run_cache=cross_run_cache,
             tags=tags or {},
+            description=description,
         )
         _STEP_REGISTRY[step_name] = meta
 
@@ -186,6 +191,12 @@ async def _execute_step(
         skipped = cached.mark_skipped(
             outputs=cached.outputs,
             artifact_uris=cached.artifact_uris,
+        )
+        skipped = skipped.model_copy(
+            update={
+                "id": uuid4(),
+                "run_id": run_id,
+            }
         )
         await store.upsert_step(skipped)
         return skipped

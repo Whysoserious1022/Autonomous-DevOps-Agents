@@ -403,7 +403,7 @@ def tester_router(state: DevOpsState) -> str:
     LangGraph conditional edge router for the Coder ↔ Tester retry loop.
 
     Routes:
-      test_passed=True  → "reviewer"   (proceed to review, or END if in Phase 3)
+      test_passed=True  → "reviewer"   (proceed to review)
       test_passed=False, retries left  → "coder"  (fix the patch)
       test_passed=False, max retries   → "__end__" (give up)
     """
@@ -411,8 +411,7 @@ def tester_router(state: DevOpsState) -> str:
     max_retries = settings().max_retries
 
     if state.get("test_passed", False):
-        # In Phase 3, we don't have reviewer agent yet, so we complete at END
-        return END
+        return "reviewer"
 
     retry_count = state.get("retry_count", 0)
     if retry_count >= max_retries:
@@ -546,12 +545,53 @@ def build_devops_graph(
 
         return updates
 
+    async def run_reviewer(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "patch_uri": state.get("patch_uri", ""),
+            "issue_title": state.get("issue_title", ""),
+            "issue_body": state.get("issue_body", ""),
+        }
+        step_state = await flow.review(step_inputs)
+        return {
+            "review_status_uri": step_state.outputs.get("review_status_uri", ""),
+            "review_approved": step_state.outputs.get("review_approved", False),
+        }
+
+    async def run_pr_creator(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "patch_uri": state.get("patch_uri", ""),
+            "commit_sha": state.get("commit_sha", ""),
+            "repo_url": state.get("repo_url", ""),
+            "issue_title": state.get("issue_title", ""),
+            "issue_number": state.get("issue_number", 0),
+            "analysis_summary": state.get("analysis_summary", ""),
+            "test_passed": state.get("test_passed", True),
+            "review_approved": state.get("review_approved", True),
+        }
+        step_state = await flow.create_pr(step_inputs)
+        return {
+            "pr_url": step_state.outputs.get("pr_url", ""),
+            "pr_number": step_state.outputs.get("pr_number", 0),
+        }
+
     # ── Add Nodes and Edges ───────────────────────────────────────────────────
 
     builder.add_node("explorer", run_explorer)
     builder.add_node("planner", run_planner)
     builder.add_node("coder", run_coder)
     builder.add_node("tester", run_tester)
+    builder.add_node("reviewer", run_reviewer)
+    builder.add_node("pr_creator", run_pr_creator)
 
     builder.set_entry_point("explorer")
     builder.add_edge("explorer", "planner")
@@ -563,8 +603,20 @@ def build_devops_graph(
         tester_router,
         {
             "coder": "coder",
+            "reviewer": "reviewer",
             END: END,
         }
     )
+
+    builder.add_conditional_edges(
+        "reviewer",
+        review_router,
+        {
+            "pr_creator": "pr_creator",
+            END: END,
+        }
+    )
+
+    builder.add_edge("pr_creator", END)
 
     return graph_wrapper.compile(builder)

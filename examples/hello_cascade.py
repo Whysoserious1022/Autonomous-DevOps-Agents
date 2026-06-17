@@ -67,7 +67,7 @@ class HelloFlow(CascadeFlow):
         await asyncio.sleep(0.2)
 
         upstream_message = inputs.get("step_one.message", "(no message)")
-        result = f"{upstream_message} → processed by Step 2!"
+        result = f"{upstream_message} -> processed by Step 2!"
         return {
             "final_result": result,
             "success": True,

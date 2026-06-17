@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cascade-postgres
+    environment:
+      POSTGRES_USER: cascade
+      POSTGRES_PASSWORD: cascade_password
+      POSTGRES_DB: cascade_metadata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cascade -d cascade_metadata"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: cascade-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: cascade_minio_user
+      MINIO_ROOT_PASSWORD: cascade_minio_password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  cascade-api:
+    build: .
+    container_name: cascade-api
+    ports:
+      - "8000:8000"
+    environment:
+      # ── Database (PostgreSQL) ────────────────────────────────────
+      - CASCADE_DATABASE_URL=postgresql+asyncpg://cascade:cascade_password@postgres:5432/cascade_metadata
+      # ── Artifact Store (MinIO/S3) ────────────────────────────────
+      - CASCADE_ARTIFACT_BACKEND=s3
+      - CASCADE_ARTIFACT_S3_BUCKET=cascade-artifacts
+      - CASCADE_ARTIFACT_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=cascade_minio_user
+      - AWS_SECRET_ACCESS_KEY=cascade_minio_password
+      - AWS_DEFAULT_REGION=us-east-1
+      # ── LLM: set to 'mock' so demo runs without real API keys ───
+      - CASCADE_LLM_MODEL=mock
+      # ── Behaviour ────────────────────────────────────────────────
+      - CASCADE_MAX_RETRIES=3
+      - CASCADE_LOG_LEVEL=INFO
+    volumes:
+      # Forward Docker socket to spawn sandboxes from inside the container
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  cascade-dashboard:
+    build: ./dashboard
+    container_name: cascade-dashboard
+    ports:
+      - "5173:5173"
+    depends_on:
+      - cascade-api
+
+volumes:
+  postgres_data:
+  minio_data:

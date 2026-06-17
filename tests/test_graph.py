@@ -110,6 +110,20 @@ async def test_devops_workflow_retry_loop(metadata_store, artifact_store):
                 "test_error_summary": "AssertionError: expected 42" if not passed else "",
             }
 
+        @step(name="reviewer", depends_on=["tester"])
+        async def review(self, inputs: dict) -> dict:
+            return {
+                "review_status_uri": "sha256://review_status",
+                "review_approved": True,
+            }
+
+        @step(name="pr_creator", depends_on=["reviewer"])
+        async def create_pr(self, inputs: dict) -> dict:
+            return {
+                "pr_url": "https://github.com/org/repo/pull/123",
+                "pr_number": 123,
+            }
+
     # Build and compile graph
     graph = build_devops_graph(
         flow_class=MockDevOpsFlow,
@@ -139,6 +153,8 @@ async def test_devops_workflow_retry_loop(metadata_store, artifact_store):
     # Verify correct routing output state
     assert final_state["test_passed"] is True
     assert final_state["retry_count"] == 1
+    assert final_state["review_approved"] is True
+    assert final_state["pr_number"] == 123
 
     # Verify Coder call 1 inputs (first attempt, retry_count=0)
     assert MockDevOpsFlow.coder_calls[0]["retry_count"] == 0
@@ -152,9 +168,9 @@ async def test_devops_workflow_retry_loop(metadata_store, artifact_store):
 
 def test_tester_router_logic():
     """Verify tester_router routes based on test_passed and retry budget."""
-    # Test passed -> reviewer (represented by END in Phase 3)
+    # Test passed -> reviewer
     state_pass: DevOpsState = {"test_passed": True}
-    assert graph_tester_router(state_pass) == "__end__"
+    assert graph_tester_router(state_pass) == "reviewer"
 
     # Test failed, retries remaining -> coder
     state_fail: DevOpsState = {"test_passed": False, "retry_count": 1}

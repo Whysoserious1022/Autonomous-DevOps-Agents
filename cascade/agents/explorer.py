@@ -132,6 +132,86 @@ class ExplorerAgent(BaseAgent):
         issue_number = inputs.get("issue_number", 0)
         max_files = inputs.get("max_files", 150)  # Analysis cap
 
+        # ── Mock Mode: skip real cloning and AST analysis ─────────────────────
+        if self._is_mock_mode():
+            import asyncio as _asyncio
+            await _asyncio.sleep(1.5)  # Simulate realistic execution time
+
+            simulated_commit_sha = commit_sha or "abc123def456789"
+            mock_repo_graph = RepoGraph(
+                repo_url=repo_url,
+                commit_sha=simulated_commit_sha,
+                files=[
+                    FileNode(
+                        path="app.py",
+                        language="python",
+                        imports=["fastapi", "os", "uvicorn"],
+                        classes=[
+                            ClassNode(
+                                name="AppFactory",
+                                lineno=10,
+                                bases=[],
+                                methods=[
+                                    FunctionNode(
+                                        name="create_app",
+                                        lineno=12,
+                                        is_async=False,
+                                        calls=["FastAPI"],
+                                    )
+                                ],
+                            )
+                        ],
+                        functions=[
+                            FunctionNode(name="get_app", lineno=5, is_async=False, calls=["create_app"])
+                        ],
+                        line_count=80,
+                    ),
+                    FileNode(
+                        path="utils.py",
+                        language="python",
+                        imports=["os"],
+                        classes=[],
+                        functions=[FunctionNode(name="get_env", lineno=3, is_async=False, calls=[])],
+                        line_count=25,
+                    ),
+                ],
+                total_files_analyzed=2,
+                languages_detected=["python"],
+                summary=(
+                    "A FastAPI web application with standard routing, middleware, "
+                    "and a utility module. The app.py creates the FastAPI instance and "
+                    "mounts all routes. The docs UI (Swagger/ReDoc) is currently "
+                    "always enabled regardless of environment."
+                ),
+            )
+            mock_relevant = RelevantFilesOutput(
+                reasoning="app.py contains the FastAPI app instantiation and is the primary file to change.",
+                files=[
+                    {"path": "app.py", "relevance_score": 0.95, "reason": "Contains FastAPI app definition"},
+                    {"path": "utils.py", "relevance_score": 0.65, "reason": "Helper utilities used by app"},
+                ],
+                entry_points=["app.py"],
+            )
+
+            repo_graph_uri = ""
+            relevant_files_uri = ""
+            if self._artifact_store:
+                repo_graph_uri = self._artifact_store.put_json(mock_repo_graph.model_dump())
+                relevant_files_uri = self._artifact_store.put_json(mock_relevant.model_dump())
+
+            cost_manifest_uri = self.store_cost_manifest()
+            return {
+                "repo_graph_uri": repo_graph_uri,
+                "relevant_files_uri": relevant_files_uri,
+                "cost_manifest_uri": cost_manifest_uri,
+                "commit_sha": simulated_commit_sha,
+                "total_files": mock_repo_graph.total_files_analyzed,
+                "languages": mock_repo_graph.languages_detected,
+                "repo_summary": mock_repo_graph.summary[:500],
+                "relevant_files": [f["path"] for f in mock_relevant.files],
+                **self.get_cost_outputs(),
+            }
+
         # ── Step 1: Clone or fetch repo ───────────────────────────────────────
         repo_path, actual_commit_sha = await self._clone_repo(repo_url, commit_sha)
 
