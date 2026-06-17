@@ -1,0 +1,53 @@
+# Cascade — Gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Cascade runtime state (LOCAL ONLY — never commit)
+.cascade/
+~/.cascade/
+
+# Environment secrets
+.env
+*.env.local
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (dashboard)
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
