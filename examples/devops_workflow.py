@@ -104,6 +104,21 @@ class DevOpsFlow(CascadeFlow):
         agent = CoderAgent(artifact_store=self._artifact_store)
         return await agent.execute(inputs)
 
+    @step(
+        name="tester",
+        depends_on=["coder"],
+        cross_run_cache=False,
+        description="Run sandbox tests inside Docker container",
+    )
+    async def test(self, inputs: dict) -> dict:
+        """
+        Node 4: Sandbox Tester.
+        Executes test suite in ephemeral container.
+        """
+        from cascade.agents.tester import TesterAgent
+        agent = TesterAgent(artifact_store=self._artifact_store)
+        return await agent.execute(inputs)
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 

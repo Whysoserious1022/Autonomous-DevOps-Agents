@@ -5,27 +5,22 @@ LangGraph integration with Cascade's persistent state backend.
 
 Provides:
   CascadeCheckpointer   — LangGraph BaseCheckpointSaver backed by MetadataStore.
-  CascadeStateGraph     — Thin wrapper around LangGraph StateGraph with:
+  CascadeGraph          — Thin wrapper around LangGraph StateGraph with:
                           - Cascade checkpointing wired in automatically
                           - Conditional edge helpers for the retry loop
                           - Type-annotated state schema
-
-Architecture:
-  The @step decorator handles caching at the coarse level (full agent steps).
-  LangGraph handles the fine-grained execution graph INSIDE an agentic step,
-  specifically the Coder ↔ Tester retry loop (Phase 3).
-
-  For Phase 2, CascadeStateGraph is used as the backbone of the DevOpsFlow DAG.
+  build_devops_graph    — Factory to build the Coder-Tester retry loop workflow.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Sequence, TypedDict, Optional, List
 
-from cascade.core.state import StepStatus
+from cascade.core.state import StepState, StepStatus
 
 # Lazy import guard — langgraph is optional
 try:
@@ -47,32 +42,33 @@ except ImportError:
 
 # ── Cascade Graph State Schema ────────────────────────────────────────────────
 
-from typing import TypedDict, Optional, List
-
-
 class DevOpsState(TypedDict, total=False):
     """
     Shared state object threaded through the DevOps pipeline DAG.
     Each node reads from and writes to this dict.
     LangGraph persists this between node executions via the checkpointer.
     """
-    # Input
+    # Inputs
     issue_url: str
     repo_url: str
     issue_number: int
     issue_title: str
     issue_body: str
+    n_branches: int
+    test_command: str
 
     # Explorer outputs
     commit_sha: str
     repo_path: str
     repo_graph_uri: str          # CAS URI → repo_graph.json
+    relevant_files_uri: str      # CAS URI → relevant_files.json
     relevant_files: list[str]
 
     # Planner outputs
     tot_branches_uri: str        # CAS URI → tot_branches.json
     selected_branch_index: int
     selected_branch: dict[str, Any]
+    analysis_summary: str
 
     # Coder outputs
     patch_uri: str               # CAS URI → patch.diff
@@ -80,8 +76,11 @@ class DevOpsState(TypedDict, total=False):
 
     # Tester outputs (Phase 3)
     test_results_uri: str        # CAS URI → test_results.xml
+    test_results_xml: str
+    test_error_summary: str
     test_passed: bool
     retry_count: int
+    previous_patch_uri: str
 
     # Reviewer outputs (Phase 4)
     review_status_uri: str
@@ -119,14 +118,181 @@ class CascadeCheckpointer(BaseCheckpointSaver if LANGGRAPH_AVAILABLE else object
         # In-memory cache for the current session
         self._cache: dict[str, CheckpointTuple] = {} if LANGGRAPH_AVAILABLE else {}
 
-    def get_tuple(self, config: dict[str, Any]) -> "CheckpointTuple | None":
+    def get_tuple(self, config: dict[str, Any]) -> CheckpointTuple | None:
         """Retrieve the most recent checkpoint for this thread."""
         if not LANGGRAPH_AVAILABLE:
             return None
         thread_id = config.get("configurable", {}).get("thread_id", "")
         checkpoint_id = config.get("configurable", {}).get("checkpoint_id")
+        
         key = f"{thread_id}:{checkpoint_id or 'latest'}"
-        return self._cache.get(key)
+        if key in self._cache:
+            return self._cache[key]
+            
+        # Fallback to sync DB lookup using event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # In an async runtime, we use nest_asyncio to run synchronous wait
+                try:
+                    import nest_asyncio
+                    nest_asyncio.apply()
+                except ImportError:
+                    pass
+            return loop.run_until_complete(self.aget_tuple(config))
+        except Exception:
+            return None
+
+    async def aget_tuple(self, config: dict[str, Any]) -> CheckpointTuple | None:
+        """Retrieve the most recent checkpoint for this thread asynchronously."""
+        if not LANGGRAPH_AVAILABLE:
+            return None
+        thread_id = config.get("configurable", {}).get("thread_id", "")
+        checkpoint_id = config.get("configurable", {}).get("checkpoint_id")
+
+        key = f"{thread_id}:{checkpoint_id or 'latest'}"
+        if key in self._cache:
+            return self._cache[key]
+
+        # Query metadata DB for the checkpoint step state
+        steps = await self._store.list_steps(thread_id)
+        checkpoint_steps = [s for s in steps if s.name == "__checkpoint__"]
+        
+        if not checkpoint_steps:
+            return None
+            
+        target_step = None
+        if checkpoint_id:
+            for s in checkpoint_steps:
+                if s.outputs.get("checkpoint_id") == checkpoint_id:
+                    target_step = s
+                    break
+        else:
+            checkpoint_steps.sort(key=lambda s: s.completed_at or datetime.min)
+            target_step = checkpoint_steps[-1] if checkpoint_steps else None
+
+        if not target_step:
+            return None
+
+        uri = target_step.outputs.get("checkpoint_uri", "")
+        if not uri:
+            return None
+
+        try:
+            data = self._artifact_store.get_bytes(uri)
+            doc = json.loads(data.decode("utf-8"))
+            checkpoint = doc["checkpoint"]
+            metadata = doc["metadata"]
+            
+            config_out = {
+                "configurable": {
+                    "thread_id": thread_id,
+                    "checkpoint_id": target_step.outputs.get("checkpoint_id"),
+                }
+            }
+            checkpoint_tuple = CheckpointTuple(
+                config=config_out,
+                checkpoint=checkpoint,
+                metadata=metadata,
+                parent_config=None,
+            )
+            self._cache[key] = checkpoint_tuple
+            return checkpoint_tuple
+        except Exception:
+            return None
+
+    def put(
+        self,
+        config: dict[str, Any],
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a checkpoint to artifact store."""
+        if not LANGGRAPH_AVAILABLE:
+            return config
+        
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            try:
+                import nest_asyncio
+                nest_asyncio.apply()
+            except ImportError:
+                pass
+        return loop.run_until_complete(
+            self.aput(config, checkpoint, metadata, new_versions)
+        )
+
+    async def aput(
+        self,
+        config: dict[str, Any],
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Async version of put. Writes to CAS and logs to metadata DB."""
+        if not LANGGRAPH_AVAILABLE:
+            return config
+            
+        thread_id = config.get("configurable", {}).get("thread_id", "")
+        checkpoint_id = checkpoint.get("id", str(uuid.uuid4()))
+
+        # 1. Serialize and store in CAS
+        checkpoint_data = json.dumps({
+            "checkpoint": checkpoint,
+            "metadata": metadata,
+        }, default=str).encode()
+        uri = self._artifact_store.put_bytes(checkpoint_data)
+
+        # 2. Persist checkpoint metadata in steps table of MetadataStore
+        import uuid as uuid_pkg
+        step_id = uuid_pkg.uuid4()
+        step_state = StepState(
+            id=step_id,
+            run_id=uuid_pkg.UUID(thread_id),
+            name="__checkpoint__",
+            input_hash=checkpoint_id,
+            status=StepStatus.COMPLETED,
+            inputs={"checkpoint_id": checkpoint_id},
+            outputs={"checkpoint_id": checkpoint_id, "checkpoint_uri": uri},
+        )
+        await self._store.upsert_step(step_state)
+
+        # 3. Cache locally for fast retrieval
+        config_out = {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        checkpoint_tuple = CheckpointTuple(
+            config=config_out,
+            checkpoint=checkpoint,
+            metadata=metadata,
+            parent_config=None,
+        )
+        self._cache[f"{thread_id}:latest"] = checkpoint_tuple
+        self._cache[f"{thread_id}:{checkpoint_id}"] = checkpoint_tuple
+
+        return config_out
+
+    def put_writes(
+        self,
+        config: dict[str, Any],
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+    ) -> None:
+        """Store intermediate writes (no-op for Cascade)."""
+        pass
+
+    async def aput_writes(
+        self,
+        config: dict[str, Any],
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+    ) -> None:
+        """Store intermediate writes asynchronously (no-op for Cascade)."""
+        pass
 
     def list(
         self,
@@ -135,7 +301,7 @@ class CascadeCheckpointer(BaseCheckpointSaver if LANGGRAPH_AVAILABLE else object
         filter: dict[str, Any] | None = None,
         before: dict[str, Any] | None = None,
         limit: int | None = None,
-    ) -> Iterator["CheckpointTuple"]:
+    ) -> Iterator[CheckpointTuple]:
         """List all checkpoints for a thread."""
         if not LANGGRAPH_AVAILABLE:
             return iter([])
@@ -144,52 +310,6 @@ class CascadeCheckpointer(BaseCheckpointSaver if LANGGRAPH_AVAILABLE else object
             if key.startswith(f"{thread_id}:"):
                 yield checkpoint_tuple
 
-    def put(
-        self,
-        config: dict[str, Any],
-        checkpoint: "Checkpoint",
-        metadata: "CheckpointMetadata",
-        new_versions: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Persist a checkpoint to artifact store."""
-        if not LANGGRAPH_AVAILABLE:
-            return config
-        thread_id = config.get("configurable", {}).get("thread_id", "")
-        checkpoint_id = checkpoint.get("id", str(uuid.uuid4()))
-
-        # Serialize and store in CAS
-        checkpoint_data = json.dumps({
-            "checkpoint": checkpoint,
-            "metadata": metadata,
-        }, default=str).encode()
-        uri = self._artifact_store.put_bytes(checkpoint_data)
-
-        # Cache locally for fast retrieval
-        checkpoint_tuple = CheckpointTuple(
-            config=config,
-            checkpoint=checkpoint,
-            metadata=metadata,
-            parent_config=None,
-        )
-        self._cache[f"{thread_id}:latest"] = checkpoint_tuple
-        self._cache[f"{thread_id}:{checkpoint_id}"] = checkpoint_tuple
-
-        return {"configurable": {"thread_id": thread_id, "checkpoint_id": checkpoint_id}}
-
-    async def aput(
-        self,
-        config: dict[str, Any],
-        checkpoint: "Checkpoint",
-        metadata: "CheckpointMetadata",
-        new_versions: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Async version of put."""
-        return self.put(config, checkpoint, metadata, new_versions)
-
-    async def aget_tuple(self, config: dict[str, Any]) -> "CheckpointTuple | None":
-        """Async version of get_tuple."""
-        return self.get_tuple(config)
-
     async def alist(
         self,
         config: dict[str, Any],
@@ -197,7 +317,7 @@ class CascadeCheckpointer(BaseCheckpointSaver if LANGGRAPH_AVAILABLE else object
         filter: dict[str, Any] | None = None,
         before: dict[str, Any] | None = None,
         limit: int | None = None,
-    ) -> Iterator["CheckpointTuple"]:
+    ) -> Iterator[CheckpointTuple]:
         """Async version of list."""
         return self.list(config, filter=filter, before=before, limit=limit)
 
@@ -233,7 +353,7 @@ class CascadeGraph:
         store: Any,
         artifact_store: Any,
         run_id: str,
-    ) -> "tuple[CascadeGraph, Any]":
+    ) -> tuple[CascadeGraph, Any]:
         """
         Create a new CascadeGraph with the given state schema.
 
@@ -251,7 +371,7 @@ class CascadeGraph:
         builder = StateGraph(state_schema)
         return cls(None, checkpointer, run_id), builder
 
-    def compile(self, builder: Any) -> "CascadeGraph":
+    def compile(self, builder: Any) -> CascadeGraph:
         """Compile the StateGraph with our checkpointer."""
         self._graph = builder.compile(checkpointer=self._checkpointer)
         return self
@@ -283,19 +403,20 @@ def tester_router(state: DevOpsState) -> str:
     LangGraph conditional edge router for the Coder ↔ Tester retry loop.
 
     Routes:
-      test_passed=True  → "reviewer"   (proceed to review)
+      test_passed=True  → "reviewer"   (proceed to review, or END if in Phase 3)
       test_passed=False, retries left  → "coder"  (fix the patch)
-      test_passed=False, max retries   → "failed" (give up)
+      test_passed=False, max retries   → "__end__" (give up)
     """
     from cascade.core.config import settings  # noqa: PLC0415
     max_retries = settings().max_retries
 
     if state.get("test_passed", False):
-        return "reviewer"
+        # In Phase 3, we don't have reviewer agent yet, so we complete at END
+        return END
 
     retry_count = state.get("retry_count", 0)
     if retry_count >= max_retries:
-        return "__end__"
+        return END
 
     return "coder"
 
@@ -304,4 +425,146 @@ def review_router(state: DevOpsState) -> str:
     """Routes from Reviewer → PR Creator (approved) or __end__ (rejected)."""
     if state.get("review_approved", False):
         return "pr_creator"
-    return "__end__"
+    return END
+
+
+# ── DevOps LangGraph Factory ──────────────────────────────────────────────────
+
+def build_devops_graph(
+    flow_class: type,
+    store: Any,
+    artifact_store: Any,
+    run_id: str,
+) -> CascadeGraph:
+    """
+    Build and compile the complete DevOps agent pipeline LangGraph.
+
+    Uses Flow steps dynamically to wrap execution. This guarantees
+    coarse caching via @step decorator works in harmony with LangGraph checkpoints.
+    """
+    graph_wrapper, builder = CascadeGraph.create(DevOpsState, store, artifact_store, run_id)
+
+    # ── Node Definitions ──────────────────────────────────────────────────────
+
+    async def run_explorer(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "repo_url": state.get("repo_url", ""),
+            "commit_sha": state.get("commit_sha", ""),
+            "issue_title": state.get("issue_title", ""),
+            "issue_body": state.get("issue_body", ""),
+            "issue_number": state.get("issue_number", 0),
+        }
+        step_state = await flow.explore(step_inputs)
+        return {
+            "commit_sha": step_state.outputs.get("commit_sha", ""),
+            "repo_graph_uri": step_state.outputs.get("repo_graph_uri", ""),
+            "relevant_files_uri": step_state.outputs.get("relevant_files_uri", ""),
+            "relevant_files": step_state.outputs.get("relevant_files", []),
+        }
+
+    async def run_planner(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "explorer.repo_graph_uri": state.get("repo_graph_uri", ""),
+            "explorer.relevant_files_uri": state.get("relevant_files_uri", ""),
+            "issue_title": state.get("issue_title", ""),
+            "issue_body": state.get("issue_body", ""),
+            "n_branches": state.get("n_branches", 3),
+        }
+        step_state = await flow.plan(step_inputs)
+        return {
+            "tot_branches_uri": step_state.outputs.get("tot_branches_uri", ""),
+            "selected_branch_index": step_state.outputs.get("selected_branch_index", 0),
+            "selected_branch": step_state.outputs.get("selected_branch", {}),
+            "analysis_summary": step_state.outputs.get("analysis_summary", ""),
+        }
+
+    async def run_coder(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "planner.selected_branch": state.get("selected_branch", {}),
+            "planner.tot_branches_uri": state.get("tot_branches_uri", ""),
+            "planner.analysis_summary": state.get("analysis_summary", ""),
+            "issue_title": state.get("issue_title", ""),
+            "issue_body": state.get("issue_body", ""),
+            "repo_url": state.get("repo_url", ""),
+            "commit_sha": state.get("commit_sha", ""),
+            # Retry feedback
+            "test_results_xml": state.get("test_results_xml", ""),
+            "test_error_summary": state.get("test_error_summary", ""),
+            "previous_patch_uri": state.get("previous_patch_uri", ""),
+            "retry_count": state.get("retry_count", 0),
+        }
+        step_state = await flow.code(step_inputs)
+        return {
+            "patch_uri": step_state.outputs.get("patch_uri", ""),
+            "cost_manifest_uri": step_state.outputs.get("cost_manifest_uri", ""),
+        }
+
+    async def run_tester(state: DevOpsState) -> dict[str, Any]:
+        flow = flow_class()
+        flow._store = store
+        flow._artifact_store = artifact_store
+        flow._run_id = uuid.UUID(run_id)
+
+        step_inputs = {
+            "patch_uri": state.get("patch_uri", ""),
+            "commit_sha": state.get("commit_sha", ""),
+            "repo_url": state.get("repo_url", ""),
+            "test_command": state.get("test_command", ""),
+            "retry_count": state.get("retry_count", 0),
+        }
+        step_state = await flow.test(step_inputs)
+        
+        test_passed = step_state.outputs.get("test_passed", False)
+        retry_count = state.get("retry_count", 0)
+
+        updates = {
+            "test_passed": test_passed,
+            "test_results_uri": step_state.outputs.get("test_results_uri", ""),
+            "test_results_xml": step_state.outputs.get("test_results_xml", ""),
+            "test_error_summary": step_state.outputs.get("test_error_summary", ""),
+        }
+
+        if not test_passed:
+            # Increment retry count and feed back failed patch to coder
+            updates["retry_count"] = retry_count + 1
+            updates["previous_patch_uri"] = state.get("patch_uri", "")
+
+        return updates
+
+    # ── Add Nodes and Edges ───────────────────────────────────────────────────
+
+    builder.add_node("explorer", run_explorer)
+    builder.add_node("planner", run_planner)
+    builder.add_node("coder", run_coder)
+    builder.add_node("tester", run_tester)
+
+    builder.set_entry_point("explorer")
+    builder.add_edge("explorer", "planner")
+    builder.add_edge("planner", "coder")
+    builder.add_edge("coder", "tester")
+
+    builder.add_conditional_edges(
+        "tester",
+        tester_router,
+        {
+            "coder": "coder",
+            END: END,
+        }
+    )
+
+    return graph_wrapper.compile(builder)
