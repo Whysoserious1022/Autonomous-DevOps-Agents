@@ -66,7 +66,9 @@ async def test_tester_agent_passing_tests(local_repo_setup, tmp_path):
         "repo_url": local_repo_setup["repo_url"],
     }
 
-    result = await agent.execute(inputs)
+    from unittest.mock import patch
+    with patch.object(agent, "_is_mock_mode", return_value=False):
+        result = await agent.execute(inputs)
 
     assert result["test_passed"] is True
     assert result["exit_code"] == 0
@@ -98,7 +100,9 @@ async def test_tester_agent_failing_patch(local_repo_setup, tmp_path):
         "repo_url": local_repo_setup["repo_url"],
     }
 
-    result = await agent.execute(inputs)
+    from unittest.mock import patch
+    with patch.object(agent, "_is_mock_mode", return_value=False):
+        result = await agent.execute(inputs)
 
     assert result["test_passed"] is False
     assert result["exit_code"] != 0

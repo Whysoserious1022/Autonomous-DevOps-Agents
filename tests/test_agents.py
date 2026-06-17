@@ -345,7 +345,7 @@ class TestExplorerASTParser:
         ):
             result = await agent.execute({
                 "repo_url": "https://github.com/test/repo",
-                "commit_sha": "",
+                "commit_sha": "deadbeef1234" + "0" * 20,
                 "issue_title": "Test issue",
                 "issue_body": "Test body",
                 "issue_number": 1,
