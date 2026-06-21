@@ -42,6 +42,10 @@ from cascade.core.config import settings
 T = TypeVar("T", bound=BaseModel)
 
 
+class LLMProviderError(RuntimeError):
+    """Raised when the model provider rejects or cannot complete a request."""
+
+
 # ── Cost Manifest ─────────────────────────────────────────────────────────────
 
 class LLMCallRecord(BaseModel):
@@ -273,6 +277,13 @@ class BaseAgent(ABC):
         Returns:
             LLMResponse with .content (str) and .cost_cents (float).
         """
+        max_cost_cents = float(os.environ.get("CASCADE_MAX_COST_CENTS", "200.0"))
+        if self._cost_manifest.total_cost_cents > max_cost_cents:
+            raise RuntimeError(
+                f"LLM cost budget exceeded: {self._cost_manifest.total_cost_cents:.2f} cents "
+                f"> {max_cost_cents:.2f} cents limit."
+            )
+
         if self._is_mock_mode(model):
             await asyncio.sleep(0.5)
             content = "This is a mock summary of the repository under test, showing a standard FastAPI setup with routes and middleware."
@@ -333,7 +344,10 @@ class BaseAgent(ABC):
             kwargs["response_format"] = response_format
 
         start = time.perf_counter()
-        response = await self._llm_call_with_retry(**kwargs)
+        try:
+            response = await self._llm_call_with_retry(**kwargs)
+        except Exception as exc:
+            raise LLMProviderError(_format_llm_provider_error(exc, chosen_model)) from exc
         duration = time.perf_counter() - start
 
         content = response.choices[0].message.content or ""
@@ -438,6 +452,8 @@ class BaseAgent(ABC):
                     if content.startswith("json"):
                         content = content[4:]
                 return output_model.model_validate_json(content)
+            except LLMProviderError:
+                raise
             except Exception as e:  # noqa: BLE001
                 if attempt == max_retries:
                     raise
@@ -493,3 +509,25 @@ class LLMResponse(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+
+
+def _format_llm_provider_error(exc: Exception, model: str) -> str:
+    """Return an actionable provider error without hiding the original cause."""
+    raw = str(exc)
+    lower = raw.lower()
+    if "quota" in lower or "resource_exhausted" in lower or "ratelimit" in lower:
+        retry_hint = ""
+        import re
+
+        retry_match = re.search(r"(?:retryDelay|retry in|retry_after)['\": ]+([0-9.]+)s?", raw, re.IGNORECASE)
+        if retry_match:
+            retry_hint = f" Retry after about {retry_match.group(1)} seconds."
+
+        return (
+            f"LLM provider quota/rate limit hit for model '{model}'.{retry_hint} "
+            "Set CASCADE_LLM_MODEL=mock for local dry runs, switch to a model/key with available quota, "
+            "or wait for the provider quota window to reset. Original error: "
+            f"{raw[:1000]}"
+        )
+
+    return f"LLM provider call failed for model '{model}': {raw[:1000]}"

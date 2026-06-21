@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -287,21 +288,30 @@ class ExplorerAgent(BaseAgent):
         """Synchronous git clone (runs in thread pool)."""
         repo_path = Path(tmp_dir) / "repo"
 
+        clone_kwargs: dict[str, Any] = {}
+        if not _is_local_repo_url(repo_url):
+            clone_kwargs = {"depth": 50, "no_single_branch": True}
+
         if target_sha:
-            # Shallow clone then checkout specific SHA
             repo = git.Repo.clone_from(
                 repo_url,
                 str(repo_path),
-                depth=50,  # Fetch enough history to find the commit
-                no_single_branch=True,
+                **clone_kwargs,
             )
             try:
                 repo.git.checkout(target_sha)
                 actual_sha = repo.head.commit.hexsha
-            except Exception:
-                actual_sha = repo.head.commit.hexsha
+            except Exception as checkout_error:
+                try:
+                    repo.git.fetch("origin", target_sha, depth=1)
+                    repo.git.checkout(target_sha)
+                    actual_sha = repo.head.commit.hexsha
+                except Exception as fetch_error:
+                    raise RuntimeError(
+                        f"Failed to checkout commit {target_sha}: {checkout_error}; {fetch_error}"
+                    ) from fetch_error
         else:
-            repo = git.Repo.clone_from(repo_url, str(repo_path), depth=1)
+            repo = git.Repo.clone_from(repo_url, str(repo_path), **clone_kwargs)
             actual_sha = repo.head.commit.hexsha
 
         return str(repo_path), actual_sha
@@ -314,12 +324,19 @@ class ExplorerAgent(BaseAgent):
         repo_path = Path(tmp_dir) / "repo"
         repo_path.mkdir()
 
+        clone_args = ["clone"]
+        if not _is_local_repo_url(repo_url):
+            clone_args.extend(["--depth", "50", "--no-single-branch"])
+        clone_args.extend([repo_url, str(repo_path)])
+
         proc = await asyncio.create_subprocess_exec(
-            "git", "clone", "--depth", "50", repo_url, str(repo_path),
+            "git", *clone_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Git clone failed for {repo_url}: {stderr.decode().strip()}")
 
         if target_sha:
             proc2 = await asyncio.create_subprocess_exec(
@@ -327,7 +344,31 @@ class ExplorerAgent(BaseAgent):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await proc2.communicate()
+            _, checkout_stderr = await proc2.communicate()
+            if proc2.returncode != 0:
+                fetch = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_path), "fetch", "--depth", "1", "origin", target_sha,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, fetch_stderr = await fetch.communicate()
+                if fetch.returncode != 0:
+                    raise RuntimeError(
+                        "Git checkout failed and fetch fallback failed for "
+                        f"{target_sha}: {checkout_stderr.decode().strip()} "
+                        f"{fetch_stderr.decode().strip()}"
+                    )
+
+                retry = await asyncio.create_subprocess_exec(
+                    "git", "-C", str(repo_path), "checkout", target_sha,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, retry_stderr = await retry.communicate()
+                if retry.returncode != 0:
+                    raise RuntimeError(
+                        f"Git checkout failed for {target_sha}: {retry_stderr.decode().strip()}"
+                    )
 
         # Get actual SHA
         proc3 = await asyncio.create_subprocess_exec(
@@ -349,52 +390,59 @@ class ExplorerAgent(BaseAgent):
         max_files: int = 150,
     ) -> RepoGraph:
         """
-        Walk the repository and build a knowledge graph via Python's ast module.
-
-        Skips: test files, __pycache__, .venv, node_modules, migrations.
-        Prioritizes: core source files, models, routes, services.
+        Walk the repository and build a knowledge graph via RepositoryKnowledgeGraph.
         """
+        from cascade.core.knowledge_graph import RepositoryKnowledgeGraph
         import asyncio
+
         loop = asyncio.get_event_loop()
-
-        # Run in thread pool (ast parsing is CPU-bound)
-        repo_graph = await loop.run_in_executor(
+        kg = RepositoryKnowledgeGraph(Path(repo_path))
+        
+        # Run in thread pool (parsing and log processing is CPU-bound)
+        kg_data = await loop.run_in_executor(
             None,
-            lambda: self._parse_repo_sync(repo_path, repo_url, commit_sha, max_files)
+            lambda: kg.build_graph(max_files=max_files)
         )
-        return repo_graph
 
-    def _parse_repo_sync(
-        self,
-        repo_path: str,
-        repo_url: str,
-        commit_sha: str,
-        max_files: int,
-    ) -> RepoGraph:
-        """Synchronous AST parsing (CPU-bound, runs in thread pool)."""
-        root = Path(repo_path)
-        file_nodes: list[FileNode] = []
-        languages: set[str] = set()
+        file_nodes = []
+        for path, info in kg_data["files"].items():
+            classes = [
+                ClassNode(
+                    name=c["name"],
+                    lineno=1,
+                    bases=c.get("bases", []),
+                    methods=[
+                        FunctionNode(name=m, lineno=1, calls=[])
+                        for m in c.get("methods", [])
+                    ]
+                )
+                for c in info.get("classes", [])
+            ]
 
-        # Collect Python files, sorted by priority
-        python_files = self._collect_python_files(root, max_files)
+            functions = [
+                FunctionNode(name=f, lineno=1, calls=[])
+                for f in info.get("functions", [])
+            ]
 
-        for py_file in python_files:
-            try:
-                file_node = self._parse_python_file(py_file, root)
-                file_nodes.append(file_node)
-                languages.add("python")
-            except (SyntaxError, UnicodeDecodeError, OSError):
-                # Skip unparseable files
-                pass
+            file_node = FileNode(
+                path=path,
+                imports=info.get("imports", []),
+                classes=classes,
+                functions=functions,
+                line_count=info.get("line_count", 0),
+            )
+            file_nodes.append(file_node)
 
         return RepoGraph(
             repo_url=repo_url,
             commit_sha=commit_sha,
             files=file_nodes,
             total_files_analyzed=len(file_nodes),
-            languages_detected=sorted(languages),
+            languages_detected=["python"],
         )
+
+
+    # ── Legacy/Test Helper Methods (Backward Compatibility) ───────────────────
 
     def _collect_python_files(self, root: Path, max_files: int) -> list[Path]:
         """Collect Python files, prioritizing core source over tests/migrations."""
@@ -408,7 +456,6 @@ class ExplorerAgent(BaseAgent):
         secondary: list[Path] = []  # Test/support files
 
         for py_file in root.rglob("*.py"):
-            # Skip excluded directories
             if any(part in SKIP_DIRS for part in py_file.parts):
                 continue
             name = py_file.name
@@ -418,7 +465,6 @@ class ExplorerAgent(BaseAgent):
             else:
                 priority.append(py_file)
 
-        # Sort: shorter paths first (core files tend to be at root level)
         priority.sort(key=lambda p: (len(p.parts), p.name))
         secondary.sort(key=lambda p: (len(p.parts), p.name))
 
@@ -436,14 +482,12 @@ class ExplorerAgent(BaseAgent):
         functions: list[FunctionNode] = []
 
         for node in ast.walk(tree):
-            # Imports
             if isinstance(node, ast.Import):
                 imports.extend(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 module = node.module or ""
                 imports.append(module)
 
-        # Top-level classes and functions
         for node in ast.iter_child_nodes(tree):
             if isinstance(node, ast.ClassDef):
                 classes.append(self._parse_class(node))
@@ -452,7 +496,7 @@ class ExplorerAgent(BaseAgent):
 
         return FileNode(
             path=rel_path.replace("\\", "/"),
-            imports=list(dict.fromkeys(imports))[:30],  # Deduplicate, limit
+            imports=list(dict.fromkeys(imports))[:30],
             classes=classes,
             functions=functions,
             line_count=len(source.splitlines()),
@@ -480,10 +524,9 @@ class ExplorerAgent(BaseAgent):
             if isinstance(child, ast.Call):
                 try:
                     call_name = ast.unparse(child.func)
-                    # Only include short names (avoid long chained calls)
                     if len(call_name) < 60:
                         calls.append(call_name)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
 
         return FunctionNode(
@@ -493,6 +536,7 @@ class ExplorerAgent(BaseAgent):
             calls=list(dict.fromkeys(calls))[:20],
             decorators=[ast.unparse(d) for d in node.decorator_list],
         )
+
 
     # ── LLM Steps ─────────────────────────────────────────────────────────────
 
@@ -559,3 +603,8 @@ class ExplorerAgent(BaseAgent):
                 parts.append(f"funcs: {', '.join(func_names)}")
             lines.append("  " + " | ".join(parts))
         return "\n".join(lines)
+
+
+def _is_local_repo_url(repo_url: str) -> bool:
+    """Return True when repo_url points to a local path rather than a remote."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", repo_url)) or Path(repo_url).expanduser().exists()

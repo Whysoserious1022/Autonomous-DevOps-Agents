@@ -26,6 +26,9 @@ Usage:
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env
+
 import asyncio
 import os
 import sys
@@ -92,7 +95,7 @@ class DevOpsFlow(CascadeFlow):
 
     @step(
         name="coder",
-        depends_on=["planner"],
+        depends_on=["planner", "explorer"],
         cross_run_cache=False,
         max_retries=3,               # Retry on Tester failure (Phase 3)
         description="Generate git-compatible unified diff patch",
@@ -108,7 +111,7 @@ class DevOpsFlow(CascadeFlow):
 
     @step(
         name="tester",
-        depends_on=["coder"],
+        depends_on=["coder", "explorer"],
         cross_run_cache=False,
         description="Run sandbox tests inside Docker container",
     )
@@ -123,7 +126,7 @@ class DevOpsFlow(CascadeFlow):
 
     @step(
         name="reviewer",
-        depends_on=["tester"],
+        depends_on=["tester", "coder"],
         cross_run_cache=False,
         description="Run static scanners and security guardrails on patch",
     )
@@ -137,7 +140,7 @@ class DevOpsFlow(CascadeFlow):
 
     @step(
         name="pr_creator",
-        depends_on=["reviewer"],
+        depends_on=["reviewer", "tester", "coder", "planner", "explorer"],
         cross_run_cache=False,
         description="Pushes branch and creates pull request on GitHub",
     )
@@ -200,7 +203,10 @@ async def main() -> None:
 
     if args.resume_from:
         # Find the most recent run of this flow to resume
-        runs = await runner.list_runs(flow_name="devops_workflow", limit=1)
+        runs = [
+            run for run in await runner.list_runs(limit=20)
+            if run.flow_name == DevOpsFlow.flow_name
+        ]
         if not runs:
             print("No previous runs found to resume.")
             sys.exit(1)
@@ -212,8 +218,8 @@ async def main() -> None:
     else:
         run_state = await runner.run(
             DevOpsFlow,
-            inputs=initial_inputs,
             tags={"source": "example", "phase": "2"},
+            **initial_inputs,
         )
 
     # ── Summary ───────────────────────────────────────────────────────────────

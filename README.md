@@ -178,7 +178,6 @@ make clean        # Wipe all state
 ```
 
 ---
-
 ## KPIs
 
 | Metric | Target | Notes |

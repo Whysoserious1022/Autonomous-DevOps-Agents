@@ -64,6 +64,21 @@ class AlwaysFailFlow(CascadeFlow):
         raise ValueError(msg)
 
 
+class SoftFailThenDownstreamFlow(CascadeFlow):
+    flow_name = "soft_fail_then_downstream_flow"
+    downstream_called: bool = False
+
+    @step(name="soft_fail", max_retries=3)
+    async def soft_fail(self, inputs: dict) -> dict:
+        msg = "temporary provider failure"
+        raise RuntimeError(msg)
+
+    @step(name="downstream", depends_on=["soft_fail"])
+    async def downstream(self, inputs: dict) -> dict:
+        SoftFailThenDownstreamFlow.downstream_called = True
+        return {"got": inputs.get("soft_fail.patch_uri", "")}
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 class TestStepDecorator:
@@ -163,6 +178,17 @@ class TestFailureHandling:
         tb_uri = dead.artifact_uris[-1]
         tb_text = flow_runner._artifact_store.get_text(tb_uri)
         assert "I always fail" in tb_text
+
+    @pytest.mark.asyncio
+    async def test_downstream_steps_do_not_run_after_failed_step(self, flow_runner: FlowRunner):
+        SoftFailThenDownstreamFlow.downstream_called = False
+
+        run_state = await flow_runner.run(SoftFailThenDownstreamFlow)
+
+        assert run_state.status.value == "failed"
+        assert run_state.steps["soft_fail"].status == StepStatus.FAILED
+        assert "downstream" not in run_state.steps
+        assert SoftFailThenDownstreamFlow.downstream_called is False
 
 
 class TestStepRegistry:

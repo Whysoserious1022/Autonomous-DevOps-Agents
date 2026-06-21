@@ -51,8 +51,13 @@ services:
       - AWS_ACCESS_KEY_ID=cascade_minio_user
       - AWS_SECRET_ACCESS_KEY=cascade_minio_password
       - AWS_DEFAULT_REGION=us-east-1
-      # ── LLM: set to 'mock' so demo runs without real API keys ───
-      - CASCADE_LLM_MODEL=mock
+      # ── LLM & API Keys ──────────────────────────────────────────
+      - CASCADE_LLM_MODEL=${CASCADE_LLM_MODEL:-mock}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # ── GitHub Token (required for PR creation) ─────────────────
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       # ── Behaviour ────────────────────────────────────────────────
       - CASCADE_MAX_RETRIES=3
       - CASCADE_LOG_LEVEL=INFO

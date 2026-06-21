@@ -22,6 +22,8 @@ ENV/
 # Cascade runtime state (LOCAL ONLY — never commit)
 .cascade/
 ~/.cascade/
+brain/
+
 
 # Environment secrets
 .env

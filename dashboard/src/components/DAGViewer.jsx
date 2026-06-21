@@ -1,130 +1,174 @@
-// dashboard/src/components/DAGViewer.jsx
+// dashboard/src/components/DAGViewer.jsx – Enhanced pipeline flow visualization
 import React, { useEffect, useState } from 'react';
-import ReactFlow, { MiniMap, Controls, Background, MarkerType } from 'reactflow';
+import ReactFlow, { Controls, Background, MarkerType, Handle, Position } from 'reactflow';
 import 'reactflow/dist/style.css';
 
-const nodePositions = {
-  explorer: { x: 50, y: 150 },
-  planner: { x: 230, y: 150 },
-  coder: { x: 410, y: 150 },
-  tester: { x: 590, y: 150 },
-  reviewer: { x: 770, y: 150 },
-  pr_creator: { x: 950, y: 150 },
+const PIPELINE = ['explorer', 'planner', 'coder', 'tester', 'reviewer', 'pr_creator'];
+
+const NODE_META = {
+  explorer:   { label: 'Explorer',    icon: '🔍', desc: 'Repo analysis' },
+  planner:    { label: 'Planner',     icon: '🌳', desc: 'ToT planning' },
+  coder:      { label: 'Coder',       icon: '⚙️', desc: 'ReAct coding' },
+  tester:     { label: 'Tester',      icon: '🧪', desc: 'Docker sandbox' },
+  reviewer:   { label: 'Reviewer',    icon: '🔒', desc: 'Security gate' },
+  pr_creator: { label: 'PR Creator',  icon: '🚀', desc: 'GitHub PR' },
 };
 
-const getStatusStyles = (status) => {
-  switch (status) {
-    case 'completed':
-      return { background: 'rgba(16, 185, 129, 0.12)', border: '2px solid #10b981', color: '#f8fafc' };
-    case 'skipped':
-      return { background: 'rgba(6, 182, 212, 0.12)', border: '2px solid #06b6d4', color: '#f8fafc' };
-    case 'running':
-      return { background: 'rgba(245, 158, 11, 0.12)', border: '2px solid #f59e0b', color: '#f8fafc', boxShadow: '0 0 15px rgba(245, 158, 11, 0.4)' };
-    case 'failed':
-    case 'permanently_failed':
-      return { background: 'rgba(239, 68, 68, 0.12)', border: '2px solid #ef4444', color: '#f8fafc' };
-    default:
-      return { background: 'rgba(255, 255, 255, 0.02)', border: '1px solid rgba(255, 255, 255, 0.1)', color: '#9ca3af' };
-  }
+const STATUS_STYLES = {
+  completed:          { bg: 'rgba(52,211,153,0.10)',  border: '#34d399', dot: '#34d399' },
+  skipped:            { bg: 'rgba(34,211,238,0.10)',  border: '#22d3ee', dot: '#22d3ee' },
+  running:            { bg: 'rgba(251,191,36,0.12)',  border: '#fbbf24', dot: '#fbbf24', glow: '0 0 20px rgba(251,191,36,0.5)' },
+  failed:             { bg: 'rgba(248,113,113,0.10)', border: '#f87171', dot: '#f87171' },
+  permanently_failed: { bg: 'rgba(248,113,113,0.10)', border: '#f87171', dot: '#f87171' },
+  pending:            { bg: 'rgba(255,255,255,0.02)', border: 'rgba(255,255,255,0.10)', dot: '#4b5563' },
 };
 
-export default function DAGViewer({ steps = {}, onSelectNode }) {
+function PipelineNode({ data }) {
+  const { step, meta, selected } = data;
+  const status = step?.status || 'pending';
+  const style = STATUS_STYLES[status] || STATUS_STYLES.pending;
+
+  return (
+    <div style={{
+      background: style.bg,
+      border: `2px solid ${selected ? '#818cf8' : style.border}`,
+      borderRadius: '12px',
+      padding: '12px 14px',
+      textAlign: 'center',
+      cursor: 'pointer',
+      minWidth: '120px',
+      boxShadow: selected
+        ? '0 0 0 3px rgba(129,140,248,0.3)'
+        : style.glow || 'none',
+      transition: 'all 0.25s',
+      backdropFilter: 'blur(10px)',
+      position: 'relative',
+    }}>
+      <Handle
+        type="target"
+        position={Position.Left}
+        style={{
+          background: style.border,
+          width: '6px',
+          height: '6px',
+          border: 'none',
+          boxShadow: `0 0 4px ${style.border}`,
+        }}
+      />
+      <div style={{ fontSize: '18px', marginBottom: '3px' }}>{meta.icon}</div>
+      <div style={{ fontWeight: 700, fontSize: '12px', color: '#f1f5f9', letterSpacing: '0.02em' }}>
+        {meta.label}
+      </div>
+      <div style={{ fontSize: '9px', color: '#64748b', marginTop: '2px' }}>{meta.desc}</div>
+      <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
+        <div style={{ width: '5px', height: '5px', borderRadius: '50%', background: style.dot,
+          boxShadow: status === 'running' ? `0 0 6px ${style.dot}` : 'none' }} />
+        <span style={{ fontSize: '9px', color: style.dot, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+          {status === 'permanently_failed' ? 'failed' : status}
+        </span>
+      </div>
+      {step?.retry_count > 0 && (
+        <div style={{ fontSize: '9px', color: '#fbbf24', marginTop: '3px' }}>
+          retry {step.retry_count}×
+        </div>
+      )}
+      <Handle
+        type="source"
+        position={Position.Right}
+        style={{
+          background: style.border,
+          width: '6px',
+          height: '6px',
+          border: 'none',
+          boxShadow: `0 0 4px ${style.border}`,
+        }}
+      />
+    </div>
+  );
+}
+
+const nodeTypes = { pipeline: PipelineNode };
+
+export default function DAGViewer({ steps = {}, onSelectNode, selectedNode }) {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
 
   useEffect(() => {
-    // Generate nodes
-    const generatedNodes = Object.keys(nodePositions).map((name) => {
-      const step = steps[name] || { status: 'pending' };
-      const baseStyle = getStatusStyles(step.status);
-      const isSelected = step.status === 'running';
+    const spacing = 170;
+    const startX = 60;
+    const y = 130;
 
-      return {
-        id: name,
-        data: { 
-          label: (
-            <div style={{ textAlign: 'center', padding: '6px' }}>
-              <div style={{ fontWeight: 'bold', fontSize: '13px' }}>{name.replace('_', ' ').toUpperCase()}</div>
-              <div style={{ fontSize: '10px', opacity: 0.8, textTransform: 'capitalize', marginTop: '2px' }}>
-                {step.status === 'pending' ? 'idle' : step.status}
-              </div>
-            </div>
-          ) 
-        },
-        position: nodePositions[name],
-        style: {
-          ...baseStyle,
-          borderRadius: '8px',
-          width: '140px',
-          fontFamily: "'Outfit', sans-serif",
-          cursor: 'pointer',
-        },
-      };
+    const generatedNodes = PIPELINE.map((name, idx) => ({
+      id: name,
+      type: 'pipeline',
+      position: { x: startX + idx * spacing, y },
+      data: {
+        step: steps[name] || { status: 'pending', retry_count: 0 },
+        meta: NODE_META[name],
+        selected: selectedNode === name,
+      },
+    }));
+
+    const getEdgeColor = (fromName) => {
+      const s = steps[fromName]?.status;
+      if (s === 'completed' || s === 'skipped') return '#34d399';
+      if (s === 'running') return '#fbbf24';
+      return 'rgba(100,116,139,0.4)';
+    };
+
+    const generatedEdges = PIPELINE.slice(0, -1).map((name, idx) => ({
+      id: `e-${name}-${PIPELINE[idx + 1]}`,
+      source: name,
+      target: PIPELINE[idx + 1],
+      animated: steps[name]?.status === 'running',
+      style: { stroke: getEdgeColor(name), strokeWidth: 2 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: getEdgeColor(name) },
+    }));
+
+    // Retry loop: tester → coder
+    const retryCount = steps['tester']?.retry_count || 0;
+    const testerFailed = steps['tester']?.status === 'failed';
+    generatedEdges.push({
+      id: 'e-retry-loop',
+      source: 'tester',
+      target: 'coder',
+      type: 'smoothstep',
+      label: retryCount > 0 ? `↩ Retry #${retryCount}` : '↩ Retry',
+      labelStyle: { fill: '#f87171', fontSize: 9, fontWeight: 700 },
+      labelBgStyle: { fill: '#0f1728', fillOpacity: 0.9 },
+      style: {
+        stroke: testerFailed ? '#f87171' : 'rgba(248,113,113,0.2)',
+        strokeWidth: 2,
+        strokeDasharray: '6,4',
+      },
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#f87171' },
     });
-
-    // Generate edges
-    const generatedEdges = [
-      { id: 'e-explorer-planner', source: 'explorer', target: 'planner', animated: steps['explorer']?.status === 'running' },
-      { id: 'e-planner-coder', source: 'planner', target: 'coder', animated: steps['planner']?.status === 'running' },
-      { id: 'e-coder-tester', source: 'coder', target: 'tester', animated: steps['coder']?.status === 'running' },
-      
-      // Tester to Reviewer
-      { 
-        id: 'e-tester-reviewer', 
-        source: 'tester', 
-        target: 'reviewer', 
-        animated: steps['tester']?.status === 'completed',
-        style: { stroke: steps['tester']?.status === 'completed' ? '#10b981' : '#6b7280' }
-      },
-      
-      // Reviewer to PR Creator
-      { 
-        id: 'e-reviewer-pr_creator', 
-        source: 'reviewer', 
-        target: 'pr_creator', 
-        animated: steps['reviewer']?.status === 'completed',
-        style: { stroke: steps['reviewer']?.status === 'completed' ? '#10b981' : '#6b7280' }
-      },
-      
-      // Loopback edge: Tester -> Coder (Retry feedback loop)
-      {
-        id: 'e-tester-coder-loop',
-        source: 'tester',
-        target: 'coder',
-        type: 'smoothstep',
-        label: steps['tester']?.retry_count > 0 ? `Retry #${steps['tester'].retry_count}` : 'Retry',
-        labelStyle: { fill: '#ef4444', fontSize: 9, fontWeight: 600, background: '#111827' },
-        style: { 
-          stroke: steps['tester']?.status === 'failed' ? '#ef4444' : 'rgba(239, 68, 68, 0.2)',
-          strokeWidth: 2, 
-          strokeDasharray: '5,5' 
-        },
-        markerEnd: { type: MarkerType.ArrowClosed, color: '#ef4444' },
-      }
-    ];
 
     setNodes(generatedNodes);
     setEdges(generatedEdges);
-  }, [steps]);
-
-  const onNodeClick = (event, node) => {
-    if (onSelectNode) {
-      onSelectNode(node.id);
-    }
-  };
+  }, [steps, selectedNode]);
 
   return (
-    <div className="react-flow-container">
+    <div style={{ width: '100%', height: '100%', background: 'radial-gradient(circle at 50% 50%, rgba(99,102,241,0.04) 0%, transparent 70%)' }}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
-        onNodeClick={onNodeClick}
+        nodeTypes={nodeTypes}
+        onNodeClick={(_, node) => onSelectNode?.(node.id)}
         fitView
-        fitViewOptions={{ padding: 0.2 }}
+        fitViewOptions={{ padding: 0.25 }}
         proOptions={{ hideAttribution: true }}
+        zoomOnScroll={false}
       >
-        <Controls showInteractive={false} style={{ background: '#1f2937', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px' }} />
-        <Background color="#374151" gap={16} size={1} />
+        <Controls
+          showInteractive={false}
+          style={{
+            background: 'rgba(15,20,40,0.9)',
+            border: '1px solid rgba(255,255,255,0.08)',
+            borderRadius: '8px',
+          }}
+        />
+        <Background color="rgba(255,255,255,0.04)" gap={24} size={1.5} />
       </ReactFlow>
     </div>
   );

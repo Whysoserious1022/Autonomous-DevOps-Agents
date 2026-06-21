@@ -20,10 +20,18 @@ Output artifacts:
 from __future__ import annotations
 
 from typing import Any
+import asyncio
 
 from pydantic import BaseModel, Field
 
 from cascade.agents.base import BaseAgent
+
+
+class CriticEvaluation(BaseModel):
+    """Evaluation output from the ToT critic."""
+    viability_score: float = Field(ge=0.0, le=1.0, description="Score of how viable this plan is (0.0 to 1.0)")
+    criticism: str = Field(description="Constructive feedback, edge cases, or potential problems with this plan")
+    mitigation_steps: list[str] = Field(default_factory=list, description="Steps to mitigate the identified risks")
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -246,12 +254,70 @@ class PlannerAgent(BaseAgent):
         custom_prompt: str,
     ) -> ToTBranchesOutput:
         """
-        Phase 2 of Tree-of-Thoughts: Generate N distinct solution branches.
-
-        Each branch is a complete, independent approach to fixing the issue.
-        Branches are scored by confidence and the highest-confidence branch
-        is automatically selected for the Coder.
+        Phase 2 of Tree-of-Thoughts: Generate solution branches, run parallel critic reviews, and backtrack if needed.
         """
+        # 1. Generate candidate branches using standard LLM call
+        tot_output = await self._raw_generate_branches(
+            repo_graph_data, relevant_files, issue_title, issue_body, rca, n_branches, custom_prompt
+        )
+
+        if self._is_mock_mode() or not tot_output.branches:
+            return tot_output
+
+        # 2. Evaluate candidate branches in parallel using Critic
+        eval_tasks = [
+            self.evaluate_candidate(b, issue_title, issue_body, rca)
+            for b in tot_output.branches
+        ]
+        evaluations = await asyncio.gather(*eval_tasks)
+
+        # 3. Update branches with Critic scores
+        for b, eval_res in zip(tot_output.branches, evaluations):
+            b.confidence = eval_res.viability_score
+            b.reasoning += f"\n\n[Architect Critic Feedback]: {eval_res.criticism}\n[Mitigations]: {', '.join(eval_res.mitigation_steps)}"
+
+        # Re-sort by updated confidence descending
+        tot_output.branches.sort(key=lambda x: x.confidence, reverse=True)
+        tot_output.selected_branch_index = 0
+
+        # 4. Backtracking: If all branches score below threshold (e.g. 0.5), run corrective generation
+        if tot_output.branches[0].confidence < 0.5:
+            corrective_feedback = "\n\nCritique of previous approaches (please avoid these issues and suggest alternative pathways):\n"
+            for idx, b in enumerate(tot_output.branches):
+                feedback_str = b.reasoning.split("[Architect Critic Feedback]:")[-1].strip()
+                corrective_feedback += f"- Branch {idx} ({b.approach_name}) Critique: {feedback_str}\n"
+
+            # Regenerate with the corrective feedback injected
+            tot_output = await self._raw_generate_branches(
+                repo_graph_data, relevant_files, issue_title, issue_body, rca, n_branches,
+                custom_prompt=f"{custom_prompt}\n{corrective_feedback}"
+            )
+            # Re-evaluate new candidates
+            eval_tasks = [
+                self.evaluate_candidate(b, issue_title, issue_body, rca)
+                for b in tot_output.branches
+            ]
+            evaluations = await asyncio.gather(*eval_tasks)
+            for b, eval_res in zip(tot_output.branches, evaluations):
+                b.confidence = eval_res.viability_score
+                b.reasoning += f"\n\n[Architect Critic Feedback]: {eval_res.criticism}"
+
+            tot_output.branches.sort(key=lambda x: x.confidence, reverse=True)
+            tot_output.selected_branch_index = 0
+
+        return tot_output
+
+    async def _raw_generate_branches(
+        self,
+        repo_graph_data: dict[str, Any],
+        relevant_files: dict[str, Any],
+        issue_title: str,
+        issue_body: str,
+        rca: RootCauseAnalysis,
+        n_branches: int,
+        custom_prompt: str,
+    ) -> ToTBranchesOutput:
+        """Call LLM directly to generate raw branches."""
         relevant_file_list = self._format_relevant_files(relevant_files)
         repo_url = repo_graph_data.get("repo_url", "unknown")
         total_files = repo_graph_data.get("total_files_analyzed", 0)
@@ -269,7 +335,9 @@ class PlannerAgent(BaseAgent):
             "2. Include concrete implementation steps (not vague)\n"
             "3. Have an honest confidence score (0.0-1.0)\n"
             "4. Identify specific risks and edge cases\n"
-            "Sort branches by confidence descending. Set selected_branch_index to 0 (highest confidence)."
+            "Sort branches by confidence descending. Set selected_branch_index to 0 (highest confidence).\n"
+            "IMPORTANT: Keep reasoning, descriptions, and code_hints extremely brief (1-2 sentences max). "
+            "Do not output long paragraphs, otherwise the JSON output will be truncated. Be concise and technical."
         ).format(n=n_branches)
 
         user = (
@@ -289,6 +357,33 @@ class PlannerAgent(BaseAgent):
             system=system,
             user=user,
             output_model=ToTBranchesOutput,
+        )
+
+    async def evaluate_candidate(
+        self,
+        branch: SolutionBranch,
+        issue_title: str,
+        issue_body: str,
+        rca: RootCauseAnalysis
+    ) -> CriticEvaluation:
+        """Critic LLM evaluation of a single branch plan."""
+        system = (
+            "You are an independent principal software architect acting as a critic. "
+            "Evaluate the proposed solution branch and find any flaws, missing imports, edge cases, or architectural issues."
+        )
+        user = (
+            f"Issue: {issue_title}\n"
+            f"Issue Description: {issue_body[:1000]}\n\n"
+            f"RCA: {rca.root_cause}\n\n"
+            f"Proposed Plan: {branch.approach_name}\n"
+            f"Hypothesis: {branch.hypothesis}\n"
+            f"Files to modify: {branch.files_to_modify}\n"
+            f"Reasoning: {branch.reasoning}\n"
+        )
+        return await self.llm_structured(
+            system=system,
+            user=user,
+            output_model=CriticEvaluation
         )
 
     def _format_relevant_files(self, relevant_files: dict[str, Any]) -> str:

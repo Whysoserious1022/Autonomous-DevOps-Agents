@@ -125,12 +125,9 @@ class PRCreatorAgent(BaseAgent):
         if not repo_url:
             raise ValueError("Missing repo_url.")
 
-        # Parse owner and repo name from URL (e.g. https://github.com/owner/repo)
-        match = re.search(r"github\.com/([^/]+)/([^/.]+)", repo_url)
-        if not match:
+        repo_fullname = _parse_github_owner_repo(repo_url)
+        if not repo_fullname:
             raise ValueError(f"Failed to parse owner/repo from URL: {repo_url}")
-        owner, repo_name = match.group(1), match.group(2)
-        repo_fullname = f"{owner}/{repo_name}"
 
         # Fetch patch content
         patch_diff = ""
@@ -165,7 +162,11 @@ class PRCreatorAgent(BaseAgent):
 
         try:
             # Clone repo
-            await self._run_git(["clone", "--depth", "50", repo_url, str(local_path)], cwd=tmp_dir)
+            clone_args = ["clone", "--depth", "50", "--no-single-branch", repo_url, str(local_path)]
+            await self._run_git(clone_args, cwd=tmp_dir)
+
+            if commit_sha and commit_sha != "HEAD":
+                await self._checkout_commit(str(local_path), commit_sha)
 
             # Checkout new branch
             await self._run_git(["checkout", "-b", branch_name], cwd=str(local_path))
@@ -256,6 +257,20 @@ class PRCreatorAgent(BaseAgent):
             raise RuntimeError(f"Git command failed: git {' '.join(args)}\nStderr: {stderr.decode()}")
         return stdout.decode().strip()
 
+    async def _checkout_commit(self, repo_path: str, commit_sha: str) -> None:
+        try:
+            await self._run_git(["checkout", commit_sha], cwd=repo_path)
+            return
+        except RuntimeError as checkout_error:
+            try:
+                await self._run_git(["fetch", "--depth", "1", "origin", commit_sha], cwd=repo_path)
+                await self._run_git(["checkout", commit_sha], cwd=repo_path)
+                return
+            except RuntimeError as fetch_error:
+                raise RuntimeError(
+                    f"Failed to checkout base commit {commit_sha}: {checkout_error}; {fetch_error}"
+                ) from fetch_error
+
     async def _ensure_git_config(self, repo_path: str) -> None:
         """Ensure git name and email are configured for local commits."""
         try:
@@ -318,3 +333,17 @@ Every LLM call, patch variant, and console output for this execution is logged a
 def uuid_suffix() -> str:
     """Return a short unique suffix for branch uniqueness."""
     return str(uuid.uuid4())[:8]
+
+
+def _parse_github_owner_repo(repo_url: str) -> str | None:
+    """Extract owner/repo from HTTPS or SSH GitHub URLs."""
+    cleaned = repo_url.strip().removesuffix(".git").rstrip("/")
+    patterns = (
+        r"github\.com[:/]([^/]+)/([^/]+)$",
+        r"^([^/\s]+)/([^/\s]+)$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return None

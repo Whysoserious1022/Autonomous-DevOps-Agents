@@ -356,3 +356,15 @@ class MetadataStore:
             )
             rows = result.scalars().all()
         return [r.to_domain() for r in rows]
+
+    async def delete_steps(self, run_id: str, names: list[str]) -> None:
+        """Delete specific step records from the database for a run (e.g., on resume)."""
+        from sqlalchemy import delete
+        async with self._session() as session:
+            await session.execute(
+                delete(StepRow).where(
+                    StepRow.run_id == run_id,
+                    StepRow.name.in_(names),
+                )
+            )
+            await session.commit()

@@ -179,3 +179,56 @@ def test_tester_router_logic():
     # Test failed, retries exhausted -> __end__
     state_exhausted: DevOpsState = {"test_passed": False, "retry_count": 3}
     assert graph_tester_router(state_exhausted) == "__end__"
+
+@pytest.mark.asyncio
+async def test_devops_workflow_aborts_on_step_failure(metadata_store, artifact_store):
+    """Verify that if a step fails (e.g., coder), graph execution aborts and raises RuntimeError."""
+    run_id = str(uuid.uuid4())
+
+    class MockFailingFlow(CascadeFlow):
+        flow_name = "mock_failing_flow"
+        explorer_called = False
+        coder_called = False
+
+        @step(name="explorer")
+        async def explore(self, inputs: dict) -> dict:
+            MockFailingFlow.explorer_called = True
+            return {"commit_sha": "sha123", "repo_graph_uri": "sha256://graph"}
+
+        @step(name="planner", depends_on=["explorer"])
+        async def plan(self, inputs: dict) -> dict:
+            return {
+                "tot_branches_uri": "sha256://branches",
+                "selected_branch": {"hypothesis": "fix bug"},
+                "analysis_summary": "missing return",
+            }
+
+        @step(name="coder", depends_on=["planner"])
+        async def code(self, inputs: dict) -> dict:
+            MockFailingFlow.coder_called = True
+            raise ValueError("LLM Rate Limit Error")
+
+        @step(name="tester", depends_on=["coder"])
+        async def test(self, inputs: dict) -> dict:
+            pytest.fail("Tester should not be run after Coder failed")
+
+    graph = build_devops_graph(
+        flow_class=MockFailingFlow,
+        store=metadata_store,
+        artifact_store=artifact_store,
+        run_id=run_id,
+    )
+
+    initial_state: DevOpsState = {
+        "repo_url": "https://github.com/org/repo",
+        "commit_sha": "sha123",
+        "issue_title": "broken test",
+        "issue_body": "test is broken",
+        "n_branches": 3,
+    }
+
+    with pytest.raises(RuntimeError, match="Step 'coder' failed"):
+        await graph.run(initial_state)
+
+    assert MockFailingFlow.explorer_called is True
+    assert MockFailingFlow.coder_called is True

@@ -1,0 +1,44 @@
+name: Cascade Self-Heal
+
+on:
+  workflow_run:
+    workflows: ["CI Build"] # Target workflow name to monitor
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  self_heal:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          uv pip install --system .[all]
+
+      - name: Run Cascade Self-Healer
+        env:
+          CASCADE_LLM_MODEL: "gemini/gemini-1.5-flash" # Default to free/accessible cloud model
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cascade run --flow examples.devops_workflow.DevOpsFlow \
+            --repo-url "https://github.com/${{ github.repository }}" \
+            --issue-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}" \
+            --tag ci_run_id=${{ github.event.workflow_run.id }} \
+            --tag trigger=ci_failure

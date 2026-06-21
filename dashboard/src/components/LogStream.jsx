@@ -1,53 +1,77 @@
-// dashboard/src/components/LogStream.jsx
-import React, { useEffect, useState, useRef } from 'react';
+// dashboard/src/components/LogStream.jsx – Terminal log panel with auto-scroll and refresh
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { RefreshCw, Terminal } from 'lucide-react';
 
 export default function LogStream({ runId, stepName }) {
   const [logs, setLogs] = useState('');
   const [loading, setLoading] = useState(false);
   const logEndRef = useRef(null);
 
-  useEffect(() => {
+  const fetchLogs = useCallback(async () => {
     if (!runId || !stepName) {
-      setLogs('Select a step on the DAG to view logs.');
+      setLogs('▶  Select a step node in the pipeline diagram to view its execution logs.\n\nAll agent reasoning traces, tool calls, and error tracebacks will appear here.');
       return;
     }
-
-    const fetchLogs = async () => {
-      setLoading(true);
-      try {
-        const res = await fetch(`http://localhost:8000/api/runs/${runId}/steps/${stepName}/logs`);
-        if (res.ok) {
-          const data = await res.json();
-          setLogs(data.logs || 'No logs generated for this step yet.');
-        } else {
-          setLogs('Failed to retrieve logs for this step.');
-        }
-      } catch (err) {
-        setLogs(`Error connecting to server: ${err.message}`);
-      } finally {
-        setLoading(false);
+    setLoading(true);
+    try {
+      const res = await fetch(`http://localhost:8000/api/runs/${runId}/steps/${stepName}/logs`);
+      if (res.ok) {
+        const data = await res.json();
+        setLogs(data.logs || `No logs for step "${stepName}" yet.`);
+      } else {
+        setLogs(`Failed to retrieve logs (${res.status}).`);
       }
-    };
-
-    fetchLogs();
+    } catch (err) {
+      setLogs(`⚠  Connection error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
   }, [runId, stepName]);
 
   useEffect(() => {
-    if (logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
+    fetchLogs();
+    // Auto-refresh every 5s for running steps
+    const interval = setInterval(fetchLogs, 5000);
+    return () => clearInterval(interval);
+  }, [fetchLogs]);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   return (
     <div className="log-panel">
       <div className="log-header">
-        <span>Console Log: {stepName || 'No step selected'}</span>
-        {loading && <span style={{ color: '#06b6d4' }}>Loading logs...</span>}
+        <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <Terminal size={12} />
+          {stepName ? `${stepName.replace('_', ' ')} · execution log` : 'Select a step'}
+        </span>
+        <button
+          id="btn-refresh-logs"
+          onClick={fetchLogs}
+          title="Refresh logs"
+          style={{
+            background: 'none',
+            border: 'none',
+            cursor: 'pointer',
+            color: loading ? '#22d3ee' : '#4b5563',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            fontSize: '11px',
+            padding: '2px 6px',
+            borderRadius: '4px',
+            transition: 'color 0.2s',
+          }}
+        >
+          <RefreshCw size={11} className={loading ? 'spinning' : ''} />
+          {loading ? 'Loading…' : 'Refresh'}
+        </button>
       </div>
-      <div className="terminal-logs">
+      <pre className="terminal-logs">
         {logs}
-        <div ref={logEndRef} />
-      </div>
+        <span ref={logEndRef} />
+      </pre>
     </div>
   );
 }

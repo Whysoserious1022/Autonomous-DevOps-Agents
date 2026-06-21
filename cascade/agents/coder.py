@@ -26,12 +26,15 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+import shutil
+import asyncio
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from cascade.agents.base import BaseAgent
+from cascade.agents.tools import WorkspaceTools
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -58,6 +61,15 @@ class PatchOutput(BaseModel):
         default_factory=list,
         description="Any breaking changes (API, config, behavior)"
     )
+
+
+class ReActAction(BaseModel):
+    """Action output from the ReAct coder model."""
+    thought: str = Field(description="Step-by-step reasoning about what to do next.")
+    tool_name: str = Field(description="The tool to call: read_file, write_file, edit_file, grep_search, list_dir, finish")
+    tool_input: dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool (e.g. {'path': 'main.py'} or {'query': 'def add'}). For 'finish', pass empty dict.")
+    explanation: str = Field(default="", description="1-paragraph explanation of what the final patch does (only when tool_name is 'finish').")
+    test_strategy: str = Field(default="", description="How to test this patch (only when tool_name is 'finish').")
 
 
 # ── Coder Agent ───────────────────────────────────────────────────────────────
@@ -124,7 +136,7 @@ class CoderAgent(BaseAgent):
                 pass
 
         # ── Generate the patch ────────────────────────────────────────────────
-        patch_output = await self._generate_patch(
+        patch_res = await self._generate_patch(
             branch=selected_branch,
             analysis_summary=analysis_summary,
             issue_title=issue_title,
@@ -137,8 +149,17 @@ class CoderAgent(BaseAgent):
             retry_count=retry_count,
         )
 
-        # ── Assemble unified diff ─────────────────────────────────────────────
-        full_diff = self._assemble_diff(patch_output, commit_sha)
+        if isinstance(patch_res, tuple):
+            full_diff, files_changed, explanation, test_strategy = patch_res
+            breaking_changes = []
+        else:
+            # Legacy/Mock test support returning PatchOutput
+            patch_output = patch_res
+            full_diff = self._assemble_diff(patch_output, commit_sha)
+            files_changed = [c.path for c in patch_output.changes]
+            explanation = patch_output.explanation
+            test_strategy = patch_output.test_strategy
+            breaking_changes = getattr(patch_output, "breaking_changes", [])
 
         # ── Validate patch locally ────────────────────────────────────────────
         validation_passed, validation_error = self._validate_patch_syntax(full_diff)
@@ -147,17 +168,15 @@ class CoderAgent(BaseAgent):
         patch_uri = self._artifact_store.put_text(full_diff) if self._artifact_store else ""
         cost_manifest_uri = self.store_cost_manifest()
 
-        files_changed = [c.path for c in patch_output.changes]
-
         return {
             "patch_uri": patch_uri,
             "patch_diff": full_diff[:2000],  # Inline preview for small patches
             "files_changed": files_changed,
             "validation_passed": validation_passed,
             "validation_error": validation_error or "",
-            "patch_explanation": patch_output.explanation,
-            "test_strategy": patch_output.test_strategy,
-            "breaking_changes": patch_output.breaking_changes,
+            "patch_explanation": explanation,
+            "test_strategy": test_strategy,
+            "breaking_changes": breaking_changes,
             "retry_count": retry_count,
             "cost_manifest_uri": cost_manifest_uri,
             **self.get_cost_outputs(),
@@ -177,51 +196,201 @@ class CoderAgent(BaseAgent):
         test_error_summary: str,
         previous_patch: str,
         retry_count: int,
-    ) -> PatchOutput:
-        """Generate a unified diff using LLM with full context."""
-        # Build retry context block
-        retry_context = ""
-        if retry_count > 0 and (test_error_summary or test_results_xml):
-            retry_context = (
-                f"\n\n## RETRY #{retry_count} — Previous patch FAILED tests\n"
-                f"Test failure summary:\n{test_error_summary}\n\n"
-                f"Previous patch (DO NOT repeat these mistakes):\n"
-                f"```diff\n{previous_patch[:3000]}\n```\n"
-                f"Fix the issues identified in the test failures."
+    ) -> tuple[str, list[str], str, str] | PatchOutput:
+        """Generate a unified diff using LLM ReAct loop or return mock in mock mode."""
+        import os
+        if self._is_mock_mode():
+            diff_content = (
+                "diff --git a/app.py b/app.py\n"
+                "--- a/app.py\n"
+                "+++ b/app.py\n"
+                "@@ -10,3 +10,8 @@\n"
+                " app = FastAPI()\n"
+                "+\n"
+                "+# Conditional docs disabling for production\n"
+                "+if os.environ.get('ENV') == 'production':\n"
+                "+    app.docs_url = None\n"
+                "+    app.redoc_url = None\n"
+            )
+            return diff_content, ["app.py"], "Conditionally configure docs_url and redoc_url on FastAPI instantiation based on ENV.", "Run pytest tests/test_docs.py"
+
+        tmp_dir = tempfile.mkdtemp(prefix="cascade_coder_")
+        repo_path = Path(tmp_dir) / "repo"
+        repo_path.mkdir()
+
+        try:
+            # 1. Clone repository
+            await self._clone_repo(repo_url, commit_sha, str(repo_path))
+
+            # Apply previous patch if we are in a retry loop
+            if previous_patch.strip():
+                try:
+                    self._apply_patch(str(repo_path), previous_patch)
+                except Exception:
+                    pass
+
+            # 2. Instantiate tools
+            tools = WorkspaceTools(repo_path)
+
+            # 3. Setup prompt contexts
+            retry_context = ""
+            if retry_count > 0 and (test_error_summary or test_results_xml):
+                retry_context = (
+                    f"\n\n## RETRY #{retry_count} — Previous patch FAILED tests\n"
+                    f"Test failure summary:\n{test_error_summary}\n\n"
+                    f"Previous patch:\n"
+                    f"```diff\n{previous_patch[:3000]}\n```\n"
+                    f"Fix the issues identified in the test failures."
+                )
+
+            branch_plan = self._format_branch_plan(branch)
+            impl_steps = self._format_implementation_steps(branch)
+
+            system_prompt = (
+                "You are an expert software engineer generating a patch to resolve a GitHub issue.\n"
+                "You are in a ReAct loop. In each step, you must output a thought and choose a tool to run.\n"
+                "Tools available:\n"
+                "- read_file: {'path': relative_path}\n"
+                "- write_file: {'path': relative_path, 'content': full_content}\n"
+                "- edit_file: {'path': relative_path, 'target': exact_text_to_replace, 'replacement': new_text}\n"
+                "- grep_search: {'query': search_string}\n"
+                "- list_dir: {'path': relative_path}\n"
+                "- finish: {}\n\n"
+                "Once you are confident you have implemented the correct fix, call the 'finish' tool. "
+                "Adhere to project style, import only existing items, and keep changes minimal."
             )
 
-        # Format branch plan
-        branch_plan = self._format_branch_plan(branch)
-        impl_steps = self._format_implementation_steps(branch)
+            user_prompt = (
+                f"Repository: {repo_url} @ {commit_sha[:8]}\n\n"
+                f"Issue: {issue_title}\n"
+                f"Description: {issue_body[:1500]}\n\n"
+                f"Root Cause Analysis:\n{analysis_summary}\n\n"
+                f"Solution Approach:\n{branch_plan}\n\n"
+                f"Implementation Steps:\n{impl_steps}"
+                f"{retry_context}"
+            )
 
-        system = (
-            "You are an expert software engineer generating a git-compatible unified diff patch. "
-            "Your patch MUST:\n"
-            "1. Be in standard `git diff` unified diff format\n"
-            "2. Include proper `--- a/file` and `+++ b/file` headers\n"
-            "3. Have `@@ -L,S +L,S @@` hunk headers with correct line numbers\n"
-            "4. Be minimal — only change lines that are necessary\n"
-            "5. Preserve existing code style, indentation, and conventions\n"
-            "6. Not introduce imports that don't exist in the codebase\n\n"
-            "For each file change, create a complete, correct unified diff. "
-            "If creating a new file, use `/dev/null` as the source."
-        )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
 
-        user = (
-            f"Repository: {repo_url} @ {commit_sha[:8]}\n\n"
-            f"Issue: {issue_title}\n"
-            f"Description: {issue_body[:1500]}\n\n"
-            f"Root Cause Analysis:\n{analysis_summary}\n\n"
-            f"Solution Approach:\n{branch_plan}\n\n"
-            f"Implementation Steps:\n{impl_steps}"
-            f"{retry_context}"
-        )
+            files_changed = set()
+            explanation = "No explanation provided."
+            test_strategy = "No test strategy provided."
+            max_steps = 12
 
-        return await self.llm_structured(
-            system=system,
-            user=user,
-            output_model=PatchOutput,
+            for step_idx in range(max_steps):
+                history_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+                user_msg = f"{history_str}\n\n[Step {step_idx + 1}/{max_steps}] Select your next Action."
+                
+                action = await self.llm_structured(
+                    system=system_prompt,
+                    user=user_msg,
+                    output_model=ReActAction,
+                )
+
+                action_desc = f"Thought: {action.thought}\nAction: Call '{action.tool_name}' with args {action.tool_input}"
+                messages.append({"role": "assistant", "content": action_desc})
+
+                if action.tool_name == "finish":
+                    explanation = action.explanation or explanation
+                    test_strategy = action.test_strategy or test_strategy
+                    break
+
+                if action.tool_name in ("write_file", "edit_file") and "path" in action.tool_input:
+                    files_changed.add(action.tool_input["path"])
+
+                tool_output = tools.execute_tool(action.tool_name, action.tool_input)
+                messages.append({"role": "user", "content": f"Tool output: {tool_output}"})
+
+            # 4. Generate the git diff patch
+            await self._run_git(["add", "-A"], cwd=str(repo_path))
+            diff_text = await self._run_git(["diff", "--cached"], cwd=str(repo_path))
+
+            return diff_text, list(files_changed), explanation, test_strategy
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def _run_git(self, args: list[str], cwd: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Git command failed: git {' '.join(args)}\nStderr: {stderr.decode()}")
+        return stdout.decode().strip()
+
+    async def _clone_repo(self, repo_url: str, commit_sha: str, dest_path: str) -> None:
+        clone_args = ["clone"]
+        if not _is_local_repo_url(repo_url):
+            clone_args.extend(["--depth", "50", "--no-single-branch"])
+        clone_args.extend([repo_url, dest_path])
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", *clone_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Git clone failed for {repo_url}: {stderr.decode().strip()}")
+
+        if commit_sha and commit_sha != "HEAD":
+            await self._checkout_commit(dest_path, commit_sha)
+
+    async def _checkout_commit(self, repo_path: str, commit_sha: str) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, "checkout", commit_sha,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            return
+
+        fetch = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, "fetch", "--depth", "1", "origin", commit_sha,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, fetch_stderr = await fetch.communicate()
+        if fetch.returncode != 0:
+            raise RuntimeError(
+                "Git checkout failed and fetch fallback failed for "
+                f"{commit_sha}: {stderr.decode().strip()} {fetch_stderr.decode().strip()}"
+            )
+
+        retry = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, "checkout", commit_sha,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, retry_stderr = await retry.communicate()
+        if retry.returncode != 0:
+            raise RuntimeError(
+                f"Git checkout failed for {commit_sha}: {retry_stderr.decode().strip()}"
+            )
+
+    def _apply_patch(self, repo_path: str, patch_diff: str) -> None:
+        patch_file = Path(repo_path) / "cascade.patch"
+        patch_file.write_text(patch_diff, encoding="utf-8")
+
+        result = subprocess.run(
+            ["git", "apply", "--ignore-whitespace", "cascade.patch"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if patch_file.exists():
+            patch_file.unlink()
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to apply patch: {result.stderr}")
 
     def _format_branch_plan(self, branch: dict[str, Any]) -> str:
         """Format the selected branch for LLM context."""
@@ -329,3 +498,8 @@ class CoderAgent(BaseAgent):
         if not has_hunk_header:
             return False, "Missing hunk headers (@@ ... @@)"
         return True, None
+
+
+def _is_local_repo_url(repo_url: str) -> bool:
+    """Return True when repo_url points to a local path rather than a remote."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", repo_url)) or Path(repo_url).expanduser().exists()

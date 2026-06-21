@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from cascade.agents.base import BaseAgent, CostManifest, LLMCallRecord, LLMResponse
+from cascade.agents.base import BaseAgent, CostManifest, LLMCallRecord, LLMProviderError, LLMResponse
 from cascade.agents.coder import CoderAgent, PatchOutput, FileChange
 from cascade.agents.explorer import (
     ExplorerAgent, FileNode, ClassNode, FunctionNode, RepoGraph
@@ -32,6 +32,9 @@ from cascade.agents.explorer import (
 from cascade.agents.planner import (
     PlannerAgent, SolutionBranch, ToTBranchesOutput, RootCauseAnalysis
 )
+from cascade.agents.pr_creator import _parse_github_owner_repo
+from cascade.agents.tools import WorkspaceTools
+from cascade.watcher.github_poller import GithubPoller
 from cascade.core.decorator import CascadeFlow, step
 from cascade.core.runner import FlowRunner
 
@@ -193,6 +196,25 @@ class TestBaseAgent:
             assert "mock" in result.content.lower() or "not installed" in result.content.lower()
         finally:
             base_module.LITELLM_AVAILABLE = original
+
+    @pytest.mark.asyncio
+    async def test_llm_quota_error_is_actionable_and_not_hidden(self, mock_artifact_store):
+        class ConcreteAgent(BaseAgent):
+            agent_name = "test"
+
+            async def execute(self, inputs: dict) -> dict:
+                return {}
+
+        agent = ConcreteAgent(artifact_store=mock_artifact_store)
+
+        async def fail_with_quota(**kwargs: Any) -> Any:
+            raise RuntimeError("RESOURCE_EXHAUSTED quota exceeded retryDelay: \"39s\"")
+
+        with patch.object(agent, "_is_mock_mode", return_value=False), patch.object(
+            agent, "_llm_call_with_retry", side_effect=fail_with_quota
+        ):
+            with pytest.raises(LLMProviderError, match="quota/rate limit"):
+                await agent.llm_complete(system="sys", user="user", model="gemini/gemini-2.5-flash")
 
 
 # ── Explorer Tests ────────────────────────────────────────────────────────────
@@ -607,6 +629,24 @@ class TestCoderAgent:
         assert "AssertionError" in captured_kwargs["test_error_summary"]
 
 
+class TestLivePathHelpers:
+    def test_workspace_tools_reject_path_traversal(self, tmp_path):
+        tools = WorkspaceTools(tmp_path)
+
+        result = tools.write_file("../outside.txt", "bad")
+
+        assert "escapes the workspace" in result
+        assert not (tmp_path.parent / "outside.txt").exists()
+
+    def test_pr_creator_parses_https_and_ssh_urls(self):
+        assert _parse_github_owner_repo("https://github.com/org/repo.git") == "org/repo"
+        assert _parse_github_owner_repo("git@github.com:org/repo.git") == "org/repo"
+
+    def test_github_poller_parses_repo_urls_without_stripping_repo_name_chars(self):
+        assert GithubPoller._parse_owner_repo("https://github.com/org/git.git") == "org/git"
+        assert GithubPoller._parse_owner_repo("git@github.com:org/widget.git") == "org/widget"
+
+
 # ── Integration Test ───────────────────────────────────────────────────────────
 
 class TestPhase2Integration:
@@ -756,4 +796,3 @@ class TestPhase2Integration:
         # Exact same inputs -> SKIP
         await flow_runner.run(StableFlow, **stable_inputs)
         assert execution_counts["explorer"] == 1, "Explorer MUST be skipped on identical inputs"
-

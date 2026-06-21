@@ -459,6 +459,8 @@ def build_devops_graph(
             "issue_number": state.get("issue_number", 0),
         }
         step_state = await flow.explore(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'explorer' failed: {step_state.error_message}")
         return {
             "commit_sha": step_state.outputs.get("commit_sha", ""),
             "repo_graph_uri": step_state.outputs.get("repo_graph_uri", ""),
@@ -480,6 +482,8 @@ def build_devops_graph(
             "n_branches": state.get("n_branches", 3),
         }
         step_state = await flow.plan(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'planner' failed: {step_state.error_message}")
         return {
             "tot_branches_uri": step_state.outputs.get("tot_branches_uri", ""),
             "selected_branch_index": step_state.outputs.get("selected_branch_index", 0),
@@ -508,6 +512,8 @@ def build_devops_graph(
             "retry_count": state.get("retry_count", 0),
         }
         step_state = await flow.code(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'coder' failed: {step_state.error_message}")
         return {
             "patch_uri": step_state.outputs.get("patch_uri", ""),
             "cost_manifest_uri": step_state.outputs.get("cost_manifest_uri", ""),
@@ -527,6 +533,8 @@ def build_devops_graph(
             "retry_count": state.get("retry_count", 0),
         }
         step_state = await flow.test(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'tester' failed: {step_state.error_message}")
         
         test_passed = step_state.outputs.get("test_passed", False)
         retry_count = state.get("retry_count", 0)
@@ -557,6 +565,8 @@ def build_devops_graph(
             "issue_body": state.get("issue_body", ""),
         }
         step_state = await flow.review(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'reviewer' failed: {step_state.error_message}")
         return {
             "review_status_uri": step_state.outputs.get("review_status_uri", ""),
             "review_approved": step_state.outputs.get("review_approved", False),
@@ -579,6 +589,8 @@ def build_devops_graph(
             "review_approved": state.get("review_approved", True),
         }
         step_state = await flow.create_pr(step_inputs)
+        if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
+            raise RuntimeError(f"Step 'pr_creator' failed: {step_state.error_message}")
         return {
             "pr_url": step_state.outputs.get("pr_url", ""),
             "pr_number": step_state.outputs.get("pr_number", 0),

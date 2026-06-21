@@ -1,74 +1,122 @@
-// dashboard/src/components/CostChart.jsx
+// dashboard/src/components/CostChart.jsx – Per-step cost breakdown bar chart
 import React from 'react';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+
+const STEP_COLORS = {
+  explorer:   '#6366f1',
+  planner:    '#8b5cf6',
+  coder:      '#22d3ee',
+  tester:     '#fbbf24',
+  reviewer:   '#f87171',
+  pr_creator: '#34d399',
+};
+
+const CustomTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  return (
+    <div style={{
+      background: 'rgba(10,14,32,0.95)',
+      border: '1px solid rgba(255,255,255,0.1)',
+      borderRadius: '8px',
+      padding: '10px 12px',
+      fontSize: '12px',
+    }}>
+      <div style={{ fontWeight: 700, color: '#f1f5f9', marginBottom: '4px', textTransform: 'capitalize' }}>
+        {label.replace('_', ' ')}
+      </div>
+      {payload.map(p => (
+        <div key={p.name} style={{ color: p.fill || '#94a3b8' }}>
+          ${p.value.toFixed(4)}
+        </div>
+      ))}
+    </div>
+  );
+};
 
 export default function CostChart({ run }) {
-  if (!run || !run.steps) return null;
+  if (!run?.steps) return null;
 
-  // Calculate Cascade actual cost and baseline Naive cost
-  let cascadeTotal = 0;
-  let naiveTotal = 0;
-
-  const stepsData = Object.entries(run.steps).map(([name, step]) => {
-    const cascadeCost = (step.llm_cost_cents || 0) / 100;
-    
-    // Naive cost: if the step was skipped, it would have run and cost money (we mock/retrieve its cached cost)
-    // If completed/failed, it ran so it costs the same.
-    const stepCostHistory = (step.outputs && step.outputs.__cost_cents__) 
-      ? step.outputs.__cost_cents__ / 100 
-      : 0.15; // default fallback cost per LLM agent execution
-      
-    const naiveCost = step.status === 'skipped' ? stepCostHistory : cascadeCost;
-
-    cascadeTotal += cascadeCost;
-    naiveTotal += naiveCost;
-
-    return {
+  const data = Object.entries(run.steps)
+    .filter(([, s]) => (s.llm_cost_cents || 0) > 0 || s.status === 'skipped')
+    .map(([name, step]) => ({
       name,
-      Cascade: parseFloat(cascadeCost.toFixed(4)),
-      Naive: parseFloat(naiveCost.toFixed(4)),
-    };
-  });
+      cost: parseFloat(((step.llm_cost_cents || 0) / 100).toFixed(5)),
+      skipped: step.status === 'skipped',
+    }));
 
-  const summaryData = [
-    {
-      name: 'Total Cost',
-      Cascade: parseFloat(cascadeTotal.toFixed(4)),
-      Naive: parseFloat(naiveTotal.toFixed(4)),
-    }
-  ];
+  const totalCost = data.reduce((s, d) => s + d.cost, 0);
+  const skippedCount = data.filter(d => d.skipped).length;
 
   return (
-    <div className="glass-panel" style={{ padding: '16px', height: '100%', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-      <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 600, color: '#9ca3af' }}>Cost Savings ($)</h3>
-      <div style={{ display: 'flex', gap: '16px', fontSize: '12px' }}>
-        <div>
-          <span style={{ color: '#6366f1', fontWeight: 'bold' }}>Cascade:</span> ${cascadeTotal.toFixed(4)}
+    <div>
+      <div className="section-title">Cost Breakdown</div>
+
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+        <div style={{
+          flex: 1,
+          padding: '8px 10px',
+          background: 'rgba(99,102,241,0.08)',
+          border: '1px solid rgba(99,102,241,0.15)',
+          borderRadius: '8px',
+          textAlign: 'center',
+        }}>
+          <div style={{ fontSize: '16px', fontWeight: 700, color: '#a5b4fc' }}>
+            ${totalCost.toFixed(4)}
+          </div>
+          <div style={{ fontSize: '9px', color: '#64748b', marginTop: '2px' }}>TOTAL COST</div>
         </div>
-        <div>
-          <span style={{ color: '#ef4444', fontWeight: 'bold' }}>Naive Run:</span> ${naiveTotal.toFixed(4)}
-        </div>
-        {naiveTotal > 0 && (
-          <div style={{ color: '#10b981', fontWeight: 'bold' }}>
-            Saved: {(((naiveTotal - cascadeTotal) / naiveTotal) * 100).toFixed(1)}%
+        {skippedCount > 0 && (
+          <div style={{
+            flex: 1,
+            padding: '8px 10px',
+            background: 'rgba(34,211,238,0.06)',
+            border: '1px solid rgba(34,211,238,0.12)',
+            borderRadius: '8px',
+            textAlign: 'center',
+          }}>
+            <div style={{ fontSize: '16px', fontWeight: 700, color: '#22d3ee' }}>{skippedCount}</div>
+            <div style={{ fontSize: '9px', color: '#64748b', marginTop: '2px' }}>CACHE HITS</div>
           </div>
         )}
       </div>
-      <div style={{ flex: 1, minHeight: '120px' }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={summaryData} margin={{ top: 5, right: 5, left: -25, bottom: 5 }}>
-            <XAxis dataKey="name" stroke="#6b7280" fontSize={11} tickLine={false} />
-            <YAxis stroke="#6b7280" fontSize={11} tickLine={false} />
-            <Tooltip
-              contentStyle={{ background: '#111827', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '6px' }}
-              labelStyle={{ fontWeight: 'bold', color: '#f3f4f6' }}
-            />
-            <Legend verticalAlign="bottom" height={20} iconSize={10} wrapperStyle={{ fontSize: '11px' }} />
-            <Bar dataKey="Cascade" fill="#6366f1" radius={[4, 4, 0, 0]} />
-            <Bar dataKey="Naive" fill="#ef4444" radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
+
+      {data.length > 0 ? (
+        <div style={{ height: '100px' }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={data} margin={{ top: 0, right: 0, left: -28, bottom: 0 }}>
+              <XAxis
+                dataKey="name"
+                stroke="#334155"
+                tick={{ fill: '#64748b', fontSize: 9 }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={n => n.substring(0, 4)}
+              />
+              <YAxis
+                stroke="#334155"
+                tick={{ fill: '#64748b', fontSize: 9 }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={v => `$${v.toFixed(2)}`}
+              />
+              <Tooltip content={<CustomTooltip />} />
+              <Bar dataKey="cost" radius={[4, 4, 0, 0]}>
+                {data.map((d) => (
+                  <Cell
+                    key={d.name}
+                    fill={d.skipped ? 'rgba(34,211,238,0.4)' : (STEP_COLORS[d.name] || '#6366f1')}
+                    opacity={d.skipped ? 0.5 : 1}
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div style={{ fontSize: '11px', color: '#475569', textAlign: 'center', padding: '12px' }}>
+          No cost data yet
+        </div>
+      )}
     </div>
   );
 }

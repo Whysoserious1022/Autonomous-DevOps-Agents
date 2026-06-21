@@ -115,6 +115,13 @@ class FlowRunner:
             tags=tags,
         )
         self._print_run_header(run_state, "NEW RUN")
+        
+        # Ensure repo_url and issue_url are propagated to flow inputs if provided as keyword arguments
+        if repo_url and "repo_url" not in initial_inputs:
+            initial_inputs["repo_url"] = repo_url
+        if issue_url and "issue_url" not in initial_inputs:
+            initial_inputs["issue_url"] = issue_url
+            
         return await self._execute_flow(flow_class, run_state, from_step=None, initial_inputs=initial_inputs)
 
     async def resume(
@@ -150,11 +157,28 @@ class FlowRunner:
             )
             raise ValueError(msg)
 
+        # Invalidate/delete database cache for from_step and downstream steps
+        flow = flow_class()
+        steps = flow.get_steps()
+        ordered = _topological_sort(steps)
+        ordered_names = [m.name for m in ordered]
+        if from_step not in ordered_names:
+            msg = f"Step '{from_step}' not found in flow '{flow_class.flow_name}'."
+            raise ValueError(msg)
+
+        idx = ordered_names.index(from_step)
+        steps_to_delete = ordered_names[idx:]
+        await self._store.delete_steps(run_id, steps_to_delete)
+
         # Update run status to RESUMED
         await self._store.update_run_status(run_id, RunStatus.RESUMED)
 
+        # Refresh run_state to reflect the deleted steps
+        refreshed_run_state = await self._store.get_run(run_id)
+        assert refreshed_run_state is not None
+
         return await self._execute_flow(
-            flow_class, run_state, from_step=from_step, initial_inputs=override_inputs
+            flow_class, refreshed_run_state, from_step=from_step, initial_inputs=override_inputs
         )
 
     async def get_run(self, run_id: str) -> RunState | None:
@@ -213,10 +237,17 @@ class FlowRunner:
                 step_state = await step_func(merged_inputs)
                 all_outputs[step_meta.name] = step_state.outputs
 
-                # Abort on unrecoverable failure
-                if step_state.status == StepStatus.PERMANENTLY_FAILED:
+                # Record Prometheus telemetry
+                try:
+                    from cascade.core.observability import CascadeTelemetry
+                    CascadeTelemetry.record_step(step_meta.name, step_state)
+                except Exception:
+                    pass
+
+                # Abort before downstream steps receive missing or partial dependency outputs.
+                if step_state.status in (StepStatus.FAILED, StepStatus.PERMANENTLY_FAILED):
                     self._console.print(
-                        f"\n[bold red]Pipeline aborted: '{step_meta.name}' permanently failed.[/bold red]"
+                        f"\n[bold red]Pipeline aborted: '{step_meta.name}' failed.[/bold red]"
                     )
                     await self._store.update_run_status(str(run_state.id), RunStatus.FAILED)
                     break
@@ -231,6 +262,12 @@ class FlowRunner:
 
         # Refresh and return final state
         final_state = await self._store.get_run(str(run_state.id))
+        if final_state:
+            try:
+                from cascade.core.observability import CascadeTelemetry
+                CascadeTelemetry.record_run(final_state)
+            except Exception:
+                pass
         self._print_run_summary(final_state or run_state)
         return final_state or run_state
 
